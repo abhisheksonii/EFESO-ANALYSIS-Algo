@@ -650,7 +650,7 @@ def main():
     """
     Main function to run the Streamlit application
     """
-    st.title("Production Analysis Dashboard")
+    st.title("Capacity Labour Dashboard")
     
     uploaded_file = st.file_uploader("Upload Production Data", type=['xlsx'])
     
