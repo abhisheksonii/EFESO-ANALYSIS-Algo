@@ -392,7 +392,7 @@ def generate_claude_analysis(sections_analysis: Dict[str, Any]) -> str:
 
     try:
         response = anthropic.messages.create(
-            model="claude-3-sonnet-20240229",
+            model="claude-3-haiku-20240307",
             max_tokens=1000,
             system="You are a production analysis expert. Provide concise, actionable insights.",
             messages=[{
