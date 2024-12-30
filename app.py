@@ -11,6 +11,27 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 anthropic = Anthropic()
 
+def read_file(uploaded_file: Any) -> pd.ExcelFile:
+    """Read different file formats and return as ExcelFile object"""
+    file_type = uploaded_file.name.split('.')[-1].lower()
+    
+    if file_type in ['xlsx', 'xls', 'xlsm', 'xlsb', 'odf', 'ods', 'odt']:
+        return pd.ExcelFile(uploaded_file)
+    elif file_type == 'csv':
+        # Create a buffer to store the CSV as Excel
+        buffer = io.BytesIO()
+        
+        # Read CSV and write to Excel format in memory
+        df = pd.read_csv(uploaded_file)
+        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False, sheet_name='Sheet1')
+            writer.close()
+        
+        buffer.seek(0)
+        return pd.ExcelFile(buffer)
+    else:
+        raise ValueError(f"Unsupported file format: {file_type}")
+
 def batch_process_sheets(uploaded_files: List[Any], batch_size: int = 7, max_batches: int = 4) -> Tuple[List[Tuple[pd.DataFrame, Any]], int]:
     """Process uploaded files in batches"""
     processed_sheets = []
@@ -19,31 +40,36 @@ def batch_process_sheets(uploaded_files: List[Any], batch_size: int = 7, max_bat
     max_sheets = batch_size * max_batches
     
     for uploaded_file in uploaded_files:
-        excel_file = pd.ExcelFile(uploaded_file)
-        
-        for sheet_name in excel_file.sheet_names:
-            if total_sheets_processed >= max_sheets:
-                skipped_sheets += 1
-                continue
-                
-            try:
-                # Read the date from first row
-                date_row = pd.read_excel(uploaded_file, sheet_name=sheet_name, nrows=1)
-                production_date = date_row.columns[0]
-                
-                # Read actual data
-                df = pd.read_excel(uploaded_file, sheet_name=sheet_name, skiprows=2)
-                processed_sheets.append((df, production_date))
-                total_sheets_processed += 1
-                
-                logger.info(f"Processed sheet {sheet_name} ({total_sheets_processed}/{max_sheets})")
-                
-            except Exception as e:
-                logger.warning(f"Error reading sheet {sheet_name}: {e}")
-                continue
+        try:
+            excel_file = read_file(uploaded_file)
             
-            if total_sheets_processed >= max_sheets:
-                break
+            for sheet_name in excel_file.sheet_names:
+                if total_sheets_processed >= max_sheets:
+                    skipped_sheets += 1
+                    continue
+                    
+                try:
+                    # Read the date from first row
+                    date_row = pd.read_excel(excel_file, sheet_name=sheet_name, nrows=1)
+                    production_date = date_row.columns[0]
+                    
+                    # Read actual data
+                    df = pd.read_excel(excel_file, sheet_name=sheet_name, skiprows=2)
+                    processed_sheets.append((df, production_date))
+                    total_sheets_processed += 1
+                    
+                    logger.info(f"Processed sheet {sheet_name} ({total_sheets_processed}/{max_sheets})")
+                    
+                except Exception as e:
+                    logger.warning(f"Error reading sheet {sheet_name}: {e}")
+                    continue
+                
+                if total_sheets_processed >= max_sheets:
+                    break
+                    
+        except Exception as e:
+            logger.warning(f"Error processing file {uploaded_file.name}: {e}")
+            continue
     
     return processed_sheets, skipped_sheets
 
@@ -375,11 +401,11 @@ def main():
     )
     
     st.title("Production Analysis Dashboard")
-    st.write("Upload production Excel files for analysis")
+    st.write("Upload production files for analysis")
     
     uploaded_files = st.file_uploader(
-        "Choose Excel files",
-        type=['xlsx', 'xls'],
+        "Choose files",
+        type=['xlsx', 'xls', 'xlsm', 'xlsb', 'odf', 'ods', 'odt', 'csv'],
         accept_multiple_files=True,
         key="file_uploader"
     )
