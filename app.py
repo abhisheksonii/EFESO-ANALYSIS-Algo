@@ -32,31 +32,41 @@ def read_file(uploaded_file: Any) -> pd.ExcelFile:
     else:
         raise ValueError(f"Unsupported file format: {file_type}")
 
-def batch_process_sheets(uploaded_files: List[Any], batch_size: int = 7, max_batches: int = 4) -> Tuple[List[Tuple[pd.DataFrame, Any]], int]:
-    """Process uploaded files in batches"""
+def batch_process_sheets(uploaded_files: List[Any], max_sheets: int, file_stats: Dict[str, int]) -> Tuple[List[Tuple[pd.DataFrame, Any]], int]:
+    """Process uploaded files up to user-defined sheet limit with progress tracking"""
     processed_sheets = []
     total_sheets_processed = 0
     skipped_sheets = 0
-    max_sheets = batch_size * max_batches
     
-    for uploaded_file in uploaded_files:
+    # Create a progress bar
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for file_index, uploaded_file in enumerate(uploaded_files):
         try:
             excel_file = read_file(uploaded_file)
+            file_stats['processed_files'] += 1
             
-            for sheet_name in excel_file.sheet_names:
+            for sheet_index, sheet_name in enumerate(excel_file.sheet_names):
                 if total_sheets_processed >= max_sheets:
                     skipped_sheets += 1
                     continue
                     
                 try:
+                    # Update progress
+                    progress = (total_sheets_processed + 1) / min(max_sheets, file_stats['total_sheets'])
+                    progress_bar.progress(progress)
+                    status_text.text(f"Processing file {file_index + 1}/{file_stats['total_files']} - Sheet {sheet_name}")
+                    
                     # Read the date from first row
                     date_row = pd.read_excel(excel_file, sheet_name=sheet_name, nrows=1)
-                    production_date = date_row.columns[0]
+                    production_date = pd.to_datetime(date_row.columns[0])
                     
                     # Read actual data
                     df = pd.read_excel(excel_file, sheet_name=sheet_name, skiprows=2)
                     processed_sheets.append((df, production_date))
                     total_sheets_processed += 1
+                    file_stats['processed_sheets'] += 1
                     
                     logger.info(f"Processed sheet {sheet_name} ({total_sheets_processed}/{max_sheets})")
                     
@@ -70,6 +80,10 @@ def batch_process_sheets(uploaded_files: List[Any], batch_size: int = 7, max_bat
         except Exception as e:
             logger.warning(f"Error processing file {uploaded_file.name}: {e}")
             continue
+    
+    # Clear progress bar and status text after completion
+    progress_bar.empty()
+    status_text.empty()
     
     return processed_sheets, skipped_sheets
 
@@ -257,72 +271,98 @@ def aggregate_machine_data(df_list: List[pd.DataFrame]) -> pd.DataFrame:
     
     return aggregated
 
+def calculate_ref_speed(section_summary):
+    """Calculate reference speed based on weighted production rates"""
+    production = section_summary['production']['total_packets']
+    hours = section_summary['total_hours']
+    return (production / (hours * 60)) if hours > 0 else 0
+
+def get_actual_manhours(section_name):
+    """Get predefined actual manhours for specific sections"""
+    # Remove shift information from section name
+    base_section = section_name.split(' (')[0].upper()
+    manhours_map = {
+        'BEASLEY DAY SHIFT PRODUCTION': 2010,
+        'SOS SECTION': 810,
+        'GARANT SECTION': 495,
+        'SHEETER SECTION': 120,
+        'HANDLE SECTION': 285
+    }
+    return manhours_map.get(base_section)
+
 def transform_to_capacity_report(sections_analysis: Dict[str, Any]) -> pd.DataFrame:
-    """Transform section analysis data into capacity report format with combined shifts"""
-    report_data = []
-    combined_sections = {}
+    """Transform section analysis data into capacity report format with updated calculations"""
+    # Factory parameters
+    FACTORY_SHIFT_PATTERN = 110
+    WORKING_DAYS_RATIO = 22 / 30
+    FIXED_MC_HOURS = 60
     
-    # First, group sections by their base name (without shift)
+    report_data = []
+    processed_sections = set()  # Track processed sections to avoid duplicates
+    
     for section_name, analysis in sections_analysis.items():
-        # Extract base section name by removing shift information
+        # Extract base section name (without shift)
         base_section = section_name.split(' (')[0]
         
-        if base_section not in combined_sections:
-            combined_sections[base_section] = {
-                'machines': analysis['summary']['total_machines'],  # Machines will be same for both shifts
-                'weekly_volume': 0,
-                'actual_hours': 0,
-                'total_packets': 0,
-                'efficiency_sum': 0,
-                'efficiency_count': 0
-            }
+        # Skip if we've already processed this base section
+        if base_section in processed_sections:
+            continue
+            
+        processed_sections.add(base_section)
         
-        # Accumulate values
-        combined_sections[base_section]['weekly_volume'] += analysis['summary']['production']['total_packets']
-        combined_sections[base_section]['actual_hours'] += analysis['summary']['total_hours']
-        combined_sections[base_section]['efficiency_sum'] += analysis['performance']['average_efficiency']
-        combined_sections[base_section]['efficiency_count'] += 1
-    
-    # Create report rows for combined sections
-    for section_name, data in combined_sections.items():
-        machines = data['machines']
-        weekly_volume = data['weekly_volume']
-        actual_hours = data['actual_hours']
-        average_efficiency = data['efficiency_sum'] / data['efficiency_count'] if data['efficiency_count'] > 0 else 0
+        # Basic metrics
+        machines = analysis['summary']['total_machines']
+        actual_hours = analysis['summary']['total_hours']
         
-        saturation = 55  # Default saturation percentage
-        dir_per_shift = actual_hours / (machines * 40) if machines > 0 else 0
+        # Calculate weekly volume with working days ratio
+        weekly_volume = analysis['summary']['production']['total_packets'] * WORKING_DAYS_RATIO
+        
+        # Calculate reference speed
+        ref_speed = calculate_ref_speed(analysis['summary'])
+        
+        # Calculate value adding hours
+        value_adding_hours = (weekly_volume / (ref_speed * 60)) / machines if (ref_speed > 0 and machines > 0) else 0
+        
+        # Get actual manhours from mapping or use calculated value
+        actual_manhours = get_actual_manhours(base_section) or actual_hours
+        
+        # Calculate direct operators per machine/shift
+        total_operators_hours = sum(
+            detail.get('hours', 0) for detail in analysis['machine_details']
+        )
+        dir_per_shift = (total_operators_hours / actual_hours) if actual_hours > 0 else 0
+        
+        # Calculate required manhours
+        required_manhours = dir_per_shift * FIXED_MC_HOURS * machines
+        
+        # Calculate organizational losses
+        org_losses = (actual_manhours / required_manhours - 1) if required_manhours > 0 else None
         
         row = {
-            'Process': section_name,
+            'Process': base_section,
             '# Mach. Avail.': machines,
             'Production Volume (Weekly)': weekly_volume,
             'Meas. Unit': 'pk',
-            'Value Adding Mc Hours / Week / Mc': actual_hours / machines if machines > 0 else 0,
-            'Ref Speed (Meas. Unit per min)': weekly_volume / (actual_hours * 60) if actual_hours > 0 else 0,
-            'Actual OEE': (average_efficiency / 100),
-            'Actual Mc Hours / Week / Mc': actual_hours / machines if machines > 0 else 0,
-            'Saturation vs. 110 hrs/wk': saturation,
-            'Dir op/ mach /shift': dir_per_shift,
-            'Required Manhours/ Week': machines * 40,
-            'Actual Manhours/ Week': actual_hours,
-            'Org. Losses': 0,
+            'Value Adding Mc Hours / Week / Mc': value_adding_hours,
+            'Ref Speed (Meas. Unit per min)': ref_speed,
+            'Actual OEE': value_adding_hours / FIXED_MC_HOURS if FIXED_MC_HOURS > 0 else None,
+            'Actual Mc Hours / Week / Mc': FIXED_MC_HOURS,
+            'Saturation vs. 110 hrs/wk': (FIXED_MC_HOURS / FACTORY_SHIFT_PATTERN) * 100,
+            'Dir op/ mach /shift': 1,  # Fixed to 1 as per requirements
+            'Required Manhours/ Week': required_manhours,
+            'Actual Manhours/ Week': actual_manhours,
+            'Org. Losses': org_losses,
             '% Overtime': 3.0,
             '% Absence': 2.0,
-            'Actual No of Dir Ops': machines * dir_per_shift
+            'Actual No of Dir Ops': machines * 1  # Using fixed dir_per_shift of 1
         }
-        
         report_data.append(row)
     
     # Create DataFrame and sort by Process name
     df = pd.DataFrame(report_data)
     df = df.sort_values('Process')
     
-    # Add totals row
-    totals = df.sum(numeric_only=True)
-    totals['Process'] = 'Total'
-    totals['Meas. Unit'] = ''
-    df = pd.concat([df, pd.DataFrame([totals])], ignore_index=True)
+    
     
     return df
 
@@ -431,13 +471,30 @@ def analyze_production_data(sections_data: Dict[str, pd.DataFrame], date_range: 
     
     return sections_analysis
 
-def read_production_data(uploaded_files: List[Any]) -> Tuple[Dict[str, pd.DataFrame], List[Any], int]:
+def read_production_data(uploaded_files: List[Any], max_sheets: int) -> Tuple[Dict[str, pd.DataFrame], List[Any], int, Dict[str, int]]:
     """Read and process production data from uploaded files"""
     try:
         all_sections = {}
         all_dates = set()
+        file_stats = {
+            'total_files': len(uploaded_files),
+            'processed_files': 0,
+            'total_sheets': 0,
+            'processed_sheets': 0
+        }
         
-        sheets_data, skipped_sheets = batch_process_sheets(uploaded_files)
+        # Count total sheets first
+        for uploaded_file in uploaded_files:
+            try:
+                excel_file = read_file(uploaded_file)
+                file_stats['total_sheets'] += len(excel_file.sheet_names)
+            except Exception as e:
+                logger.warning(f"Error counting sheets in {uploaded_file.name}: {e}")
+            finally:
+                # Reset file position for later reading
+                uploaded_file.seek(0)
+        
+        sheets_data, skipped_sheets = batch_process_sheets(uploaded_files, max_sheets, file_stats)
         section_data_collection = {}
         
         columns = [
@@ -449,6 +506,12 @@ def read_production_data(uploaded_files: List[Any]) -> Tuple[Dict[str, pd.DataFr
         
         for df_full, production_date in sheets_data:
             sections = identify_sections(df_full)
+            if isinstance(production_date, str):
+                try:
+                    # Try to parse the date if it's a string
+                    production_date = pd.to_datetime(production_date)
+                except:
+                    pass
             all_dates.add(production_date)
             
             for section in sections:
@@ -467,7 +530,7 @@ def read_production_data(uploaded_files: List[Any]) -> Tuple[Dict[str, pd.DataFr
         for section_key, df_list in section_data_collection.items():
             all_sections[section_key] = aggregate_machine_data(df_list)
         
-        return all_sections, sorted(list(all_dates)), skipped_sheets
+        return all_sections, sorted(list(all_dates)), skipped_sheets, file_stats
     
     except Exception as e:
         logger.error(f"Error reading production data: {e}")
@@ -481,8 +544,18 @@ def main():
         layout="wide"
     )
     
-    st.title("Production Analysis Dashboard")
+    st.title("Capacity Labour Dashboard")
     st.write("Upload production files for analysis")
+    
+    # Add configuration section
+    with st.expander("Configuration", expanded=True):
+        max_sheets = st.number_input(
+            "Maximum number of sheets to process",
+            min_value=1,
+            max_value=1000,
+            value=28,
+            help="Set the maximum number of sheets to process from all uploaded files. Higher numbers will take longer to process."
+        )
     
     uploaded_files = st.file_uploader(
         "Choose files",
@@ -494,19 +567,28 @@ def main():
     if uploaded_files:
         try:
             with st.spinner('Processing production data...'):
-                # Read and process the uploaded files
-                sections_data, date_range, skipped_sheets = read_production_data(uploaded_files)
+                # Read and process the uploaded files with user-defined limit
+                sections_data, date_range, skipped_sheets, file_stats = read_production_data(uploaded_files, max_sheets)
+                
+                # Display file processing statistics
+                st.success(f"Successfully processed {file_stats['processed_files']} files containing {file_stats['processed_sheets']} sheets")
                 
                 if skipped_sheets > 0:
-                    st.warning(f"Skipped {skipped_sheets} sheets due to processing limits")
+                    st.warning(f"Skipped {skipped_sheets} sheets due to reaching the configured limit of {max_sheets} sheets")
                 
-                # Display date range
+                # Display date range with proper formatting
                 st.subheader("Analysis Period")
                 date_col1, date_col2 = st.columns(2)
                 with date_col1:
-                    st.write(f"Start Date: {min(date_range)}")
+                    start_date = min(date_range)
+                    if isinstance(start_date, pd.Timestamp):
+                        start_date = start_date.strftime('%Y-%m-%d')
+                    st.write(f"Start Date: {start_date}")
                 with date_col2:
-                    st.write(f"End Date: {max(date_range)}")
+                    end_date = max(date_range)
+                    if isinstance(end_date, pd.Timestamp):
+                        end_date = end_date.strftime('%Y-%m-%d')
+                    st.write(f"End Date: {end_date}")
                 
                 # Generate analysis for all sections
                 sections_analysis = analyze_production_data(
