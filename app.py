@@ -102,10 +102,19 @@ def identify_sections(df_full: pd.DataFrame) -> List[Dict[str, Any]]:
         if "NIGHT SHIFT" in row_text.upper():
             is_night_shift = True
             if current_section and start_idx is not None:
+                # Find the actual end by looking for summary row
+                end_idx = idx - 1
+                while end_idx > start_idx:
+                    summary_row_text = ' '.join(str(cell).strip() for cell in df_full.iloc[end_idx] if pd.notna(cell))
+                    if "Machine No" in summary_row_text and "Supervisor" in summary_row_text and "NAME" in summary_row_text:
+                        end_idx -= 1
+                    else:
+                        break
+                        
                 sections.append({
                     'name': current_section,
                     'start': start_idx,
-                    'end': idx - 1,
+                    'end': end_idx,
                     'shift': 'Day'
                 })
                 current_section = None
@@ -116,10 +125,19 @@ def identify_sections(df_full: pd.DataFrame) -> List[Dict[str, Any]]:
         for header in section_headers:
             if header.strip().upper() in row_text.strip().upper():
                 if current_section and start_idx is not None:
+                    # Find the actual end by looking for summary row
+                    end_idx = idx - 1
+                    while end_idx > start_idx:
+                        summary_row_text = ' '.join(str(cell).strip() for cell in df_full.iloc[end_idx] if pd.notna(cell))
+                        if "Machine No" in summary_row_text and "Supervisor" in summary_row_text and "NAME" in summary_row_text:
+                            end_idx -= 1
+                        else:
+                            break
+                            
                     sections.append({
                         'name': current_section,
                         'start': start_idx,
-                        'end': idx - 1,
+                        'end': end_idx,
                         'shift': 'Night' if is_night_shift else 'Day'
                     })
                 
@@ -129,10 +147,19 @@ def identify_sections(df_full: pd.DataFrame) -> List[Dict[str, Any]]:
         
         # Check for section end markers
         if current_section and any(marker in row_text.upper() for marker in ['SUMMARY', 'TOTAL']):
+            # Find the actual end by looking for summary row
+            end_idx = idx - 1
+            while end_idx > start_idx:
+                summary_row_text = ' '.join(str(cell).strip() for cell in df_full.iloc[end_idx] if pd.notna(cell))
+                if "Machine No" in summary_row_text and "Supervisor" in summary_row_text and "NAME" in summary_row_text:
+                    end_idx -= 1
+                else:
+                    break
+                    
             sections.append({
                 'name': current_section,
                 'start': start_idx,
-                'end': idx - 1,
+                'end': end_idx,
                 'shift': 'Night' if is_night_shift else 'Day'
             })
             current_section = None
@@ -140,10 +167,19 @@ def identify_sections(df_full: pd.DataFrame) -> List[Dict[str, Any]]:
     
     # Add last section if exists
     if current_section and start_idx is not None:
+        # Find the actual end by looking for summary row
+        end_idx = len(df_full) - 1
+        while end_idx > start_idx:
+            summary_row_text = ' '.join(str(cell).strip() for cell in df_full.iloc[end_idx] if pd.notna(cell))
+            if "Machine No" in summary_row_text and "Supervisor" in summary_row_text and "NAME" in summary_row_text:
+                end_idx -= 1
+            else:
+                break
+                
         sections.append({
             'name': current_section,
             'start': start_idx,
-            'end': len(df_full) - 1,
+            'end': end_idx,
             'shift': 'Night' if is_night_shift else 'Day'
         })
     
@@ -151,10 +187,29 @@ def identify_sections(df_full: pd.DataFrame) -> List[Dict[str, Any]]:
 
 def process_section_data(df_section: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
     """Process section DataFrame by cleaning and standardizing data"""
+    # Create a copy to avoid modifying the original
+    df_section = df_section.copy()
+    
+    # Filter out summary rows where Machine_No/Supervisor/NAME contains their column names
+    df_section = df_section[
+        ~(
+            (df_section.iloc[:, 0].astype(str).str.contains('Machine No', case=False, na=False)) &
+            (df_section.iloc[:, 1].astype(str).str.contains('Supervisor', case=False, na=False)) &
+            (df_section.iloc[:, 2].astype(str).str.contains('NAME', case=False, na=False))
+        )
+    ]
+    
     # Rename columns
     for i, col in enumerate(columns):
         if i < len(df_section.columns):
             df_section.rename(columns={df_section.columns[i]: col}, inplace=True)
+    
+    # Filter out rows where Machine_No equals "Machine No" (additional safety check)
+    df_section = df_section[df_section['Machine_No'] != 'Machine No']
+    
+    # Convert SAP_Code to string explicitly
+    if 'SAP_Code' in df_section.columns:
+        df_section['SAP_Code'] = df_section['SAP_Code'].fillna('').astype(str)
     
     # Clean numeric columns
     numeric_columns = [
@@ -165,7 +220,7 @@ def process_section_data(df_section: pd.DataFrame, columns: List[str]) -> pd.Dat
     
     for col in numeric_columns:
         if col in df_section.columns:
-            df_section[col] = pd.to_numeric(df_section[col], errors='coerce')
+            df_section[col] = pd.to_numeric(df_section[col], errors='coerce').fillna(0)
     
     return df_section
 
@@ -203,13 +258,37 @@ def aggregate_machine_data(df_list: List[pd.DataFrame]) -> pd.DataFrame:
     return aggregated
 
 def transform_to_capacity_report(sections_analysis: Dict[str, Any]) -> pd.DataFrame:
-    """Transform section analysis data into capacity report format"""
+    """Transform section analysis data into capacity report format with combined shifts"""
     report_data = []
+    combined_sections = {}
     
+    # First, group sections by their base name (without shift)
     for section_name, analysis in sections_analysis.items():
-        weekly_volume = analysis['summary']['production']['total_packets']
-        actual_hours = analysis['summary']['total_hours']
-        machines = analysis['summary']['total_machines']
+        # Extract base section name by removing shift information
+        base_section = section_name.split(' (')[0]
+        
+        if base_section not in combined_sections:
+            combined_sections[base_section] = {
+                'machines': analysis['summary']['total_machines'],  # Machines will be same for both shifts
+                'weekly_volume': 0,
+                'actual_hours': 0,
+                'total_packets': 0,
+                'efficiency_sum': 0,
+                'efficiency_count': 0
+            }
+        
+        # Accumulate values
+        combined_sections[base_section]['weekly_volume'] += analysis['summary']['production']['total_packets']
+        combined_sections[base_section]['actual_hours'] += analysis['summary']['total_hours']
+        combined_sections[base_section]['efficiency_sum'] += analysis['performance']['average_efficiency']
+        combined_sections[base_section]['efficiency_count'] += 1
+    
+    # Create report rows for combined sections
+    for section_name, data in combined_sections.items():
+        machines = data['machines']
+        weekly_volume = data['weekly_volume']
+        actual_hours = data['actual_hours']
+        average_efficiency = data['efficiency_sum'] / data['efficiency_count'] if data['efficiency_count'] > 0 else 0
         
         saturation = 55  # Default saturation percentage
         dir_per_shift = actual_hours / (machines * 40) if machines > 0 else 0
@@ -221,7 +300,7 @@ def transform_to_capacity_report(sections_analysis: Dict[str, Any]) -> pd.DataFr
             'Meas. Unit': 'pk',
             'Value Adding Mc Hours / Week / Mc': actual_hours / machines if machines > 0 else 0,
             'Ref Speed (Meas. Unit per min)': weekly_volume / (actual_hours * 60) if actual_hours > 0 else 0,
-            'Actual OEE': (analysis['performance']['average_efficiency'] / 100),
+            'Actual OEE': (average_efficiency / 100),
             'Actual Mc Hours / Week / Mc': actual_hours / machines if machines > 0 else 0,
             'Saturation vs. 110 hrs/wk': saturation,
             'Dir op/ mach /shift': dir_per_shift,
@@ -235,7 +314,9 @@ def transform_to_capacity_report(sections_analysis: Dict[str, Any]) -> pd.DataFr
         
         report_data.append(row)
     
+    # Create DataFrame and sort by Process name
     df = pd.DataFrame(report_data)
+    df = df.sort_values('Process')
     
     # Add totals row
     totals = df.sum(numeric_only=True)
