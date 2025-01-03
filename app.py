@@ -1,15 +1,33 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lit, concat, monotonically_increasing_id
+import tempfile
+import os
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
 import logging
 from datetime import datetime
 from typing import Dict, List, Tuple, Any
 from anthropic import Anthropic
-import io 
+import io
+import numpy as np
+from openpyxl.styles import PatternFill, Border, Side, Font, Alignment
+from openpyxl.utils import get_column_letter
+from io import BytesIO
+
 # Set up logging and Anthropic client
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 anthropic = Anthropic()
+
+# Initialize Spark Session
+@st.cache_resource
+def create_spark_session():
+    return SparkSession.builder \
+        .appName("FileTransformer") \
+        .config("spark.driver.memory", "4g") \
+        .getOrCreate()
 
 def read_file(uploaded_file: Any) -> pd.ExcelFile:
     """Read different file formats and return as ExcelFile object"""
@@ -18,214 +36,185 @@ def read_file(uploaded_file: Any) -> pd.ExcelFile:
     if file_type in ['xlsx', 'xls', 'xlsm', 'xlsb', 'odf', 'ods', 'odt']:
         return pd.ExcelFile(uploaded_file)
     elif file_type == 'csv':
-        # Create a buffer to store the CSV as Excel
         buffer = io.BytesIO()
-        
-        # Read CSV and write to Excel format in memory
         df = pd.read_csv(uploaded_file)
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             df.to_excel(writer, index=False, sheet_name='Sheet1')
             writer.close()
-        
         buffer.seek(0)
         return pd.ExcelFile(buffer)
     else:
         raise ValueError(f"Unsupported file format: {file_type}")
 
-def batch_process_sheets(uploaded_files: List[Any], max_sheets: int, file_stats: Dict[str, int]) -> Tuple[List[Tuple[pd.DataFrame, Any]], int]:
-    """Process uploaded files up to user-defined sheet limit with progress tracking"""
-    processed_sheets = []
-    total_sheets_processed = 0
-    skipped_sheets = 0
-    
-    # Create a progress bar
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for file_index, uploaded_file in enumerate(uploaded_files):
-        try:
-            excel_file = read_file(uploaded_file)
-            file_stats['processed_files'] += 1
-            
-            for sheet_index, sheet_name in enumerate(excel_file.sheet_names):
-                if total_sheets_processed >= max_sheets:
-                    skipped_sheets += 1
-                    continue
-                    
-                try:
-                    # Update progress
-                    progress = (total_sheets_processed + 1) / min(max_sheets, file_stats['total_sheets'])
-                    progress_bar.progress(progress)
-                    status_text.text(f"Processing file {file_index + 1}/{file_stats['total_files']} - Sheet {sheet_name}")
-                    
-                    # Read the date from first row
-                    date_row = pd.read_excel(excel_file, sheet_name=sheet_name, nrows=1)
-                    production_date = pd.to_datetime(date_row.columns[0])
-                    
-                    # Read actual data
-                    df = pd.read_excel(excel_file, sheet_name=sheet_name, skiprows=2)
-                    processed_sheets.append((df, production_date))
-                    total_sheets_processed += 1
-                    file_stats['processed_sheets'] += 1
-                    
-                    logger.info(f"Processed sheet {sheet_name} ({total_sheets_processed}/{max_sheets})")
-                    
-                except Exception as e:
-                    logger.warning(f"Error reading sheet {sheet_name}: {e}")
-                    continue
-                
-                if total_sheets_processed >= max_sheets:
-                    break
-                    
-        except Exception as e:
-            logger.warning(f"Error processing file {uploaded_file.name}: {e}")
-            continue
-    
-    # Clear progress bar and status text after completion
-    progress_bar.empty()
-    status_text.empty()
-    
-    return processed_sheets, skipped_sheets
-
-def identify_sections(df_full: pd.DataFrame) -> List[Dict[str, Any]]:
-    """Identify different sections and their row ranges"""
-    sections = []
-    current_section = None
-    start_idx = None
-    is_night_shift = False
-    
-    section_headers = [
+def process_file_by_sections(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Process file section by section, maintaining the sequence"""
+    section_sequence = [
         "BEASLEY DAY SHIFT PRODUCTION",
         "SOS SECTION",
-        "MATADOR SECTION",
-        "SHEETER SECTION",
-        "HANDLE SECTION",
+        "Amazon ( Holweg + Garant ) Machines",
         "GARANT SECTION",
-        "AMAZON SECTION",
-        "DAILY PRODUCTION REPORT (NIGHT SHIFT)"
+        "HANDLE SECTION",
+        "MATADOR SECTION",
+        "WICKETTING SECTION",
+        "SHEETER SECTION",
+        "DAILY PRODUCTION REPORT (NIGHT SHIFT)",
+        "BEASLEY SECTION",
+        "MATADOR SECTION",
+        "SOS SECTION",
+        "GARANT SECTION",
+        "SHEETER SECTION",
+        "Amazon ( Holweg + Garant ) Machines",
+        "HANDLE SECTION"
     ]
     
-    # Add first section by default
-    current_section = "BEASLEY DAY SHIFT PRODUCTION"
-    start_idx = 0
+    # Define section identifiers with variations
+    section_identifiers = {
+        "BEASLEY DAY SHIFT PRODUCTION": ["BEASLEY", "B-"],
+        "SOS SECTION": ["SOS", "CH-"],
+        "Amazon ( Holweg + Garant ) Machines": ["AMAZON", "HOLWEG", "GARANT MACHINES", "AMAZON ( HOLWEG", "HOLWEG + GARANT"],
+        "GARANT SECTION": ["GARANT SECTION"],
+        "HANDLE SECTION": ["HANDLE"],
+        "MATADOR SECTION": ["MATADOR"],
+        "WICKETTING SECTION": ["WICKETTING"],
+        "SHEETER SECTION": ["SHEETER"],
+        "BEASLEY SECTION": ["BEASLEY", "B-"],
+        "DAILY PRODUCTION REPORT (NIGHT SHIFT)": ["NIGHT SHIFT", "NIGHT PRODUCTION"]
+    }
     
-    for idx, row in df_full.iterrows():
-        row_text = ' '.join(str(cell).strip() for cell in row if pd.notna(cell))
+    processed_sections = []
+    current_section = None
+    section_data = []
+    is_night_shift = False
+    
+    def match_section(text: str, section_name: str) -> bool:
+        """Helper function to match section text with identifiers"""
+        if section_name not in section_identifiers:
+            return False
+        return any(identifier in text for identifier in section_identifiers[section_name])
+    
+    def get_section_for_machine(machine_code: str) -> Tuple[str, bool]:
+        """Determine section and shift based on machine code"""
+        machine_code = machine_code.upper()
+        is_night = machine_code.endswith("-N")
+        
+        if machine_code.startswith("B-"):
+            return ("BEASLEY SECTION" if is_night else "BEASLEY DAY SHIFT PRODUCTION", is_night)
+        elif machine_code.startswith("CH-"):
+            return ("SOS SECTION", is_night)
+        return (None, is_night)
+    
+    for idx, row in df.iterrows():
+        row_text = ' '.join(str(cell).strip() for cell in row if pd.notna(cell)).upper()
+        
+        if not row_text.strip():
+            continue
         
         # Check for night shift marker
-        if "NIGHT SHIFT" in row_text.upper():
+        if "NIGHT SHIFT" in row_text or "NIGHT PRODUCTION" in row_text:
             is_night_shift = True
-            if current_section and start_idx is not None:
-                # Find the actual end by looking for summary row
-                end_idx = idx - 1
-                while end_idx > start_idx:
-                    summary_row_text = ' '.join(str(cell).strip() for cell in df_full.iloc[end_idx] if pd.notna(cell))
-                    if "Machine No" in summary_row_text and "Supervisor" in summary_row_text and "NAME" in summary_row_text:
-                        end_idx -= 1
-                    else:
-                        break
-                        
-                sections.append({
+            if current_section and section_data:
+                processed_sections.append({
                     'name': current_section,
-                    'start': start_idx,
-                    'end': end_idx,
+                    'data': pd.DataFrame(section_data),
                     'shift': 'Day'
                 })
-                current_section = None
-                start_idx = None
+                section_data = []
+            current_section = None
             continue
         
         # Check for section headers
-        for header in section_headers:
-            if header.strip().upper() in row_text.strip().upper():
-                if current_section and start_idx is not None:
-                    # Find the actual end by looking for summary row
-                    end_idx = idx - 1
-                    while end_idx > start_idx:
-                        summary_row_text = ' '.join(str(cell).strip() for cell in df_full.iloc[end_idx] if pd.notna(cell))
-                        if "Machine No" in summary_row_text and "Supervisor" in summary_row_text and "NAME" in summary_row_text:
-                            end_idx -= 1
-                        else:
-                            break
-                            
-                    sections.append({
+        for section in section_sequence:
+            if match_section(row_text, section):
+                if current_section and section_data:
+                    processed_sections.append({
                         'name': current_section,
-                        'start': start_idx,
-                        'end': end_idx,
+                        'data': pd.DataFrame(section_data),
                         'shift': 'Night' if is_night_shift else 'Day'
                     })
-                
-                current_section = header
-                start_idx = idx + 1
+                    section_data = []
+                current_section = section
                 break
         
-        # Check for section end markers
-        if current_section and any(marker in row_text.upper() for marker in ['SUMMARY', 'TOTAL']):
-            # Find the actual end by looking for summary row
-            end_idx = idx - 1
-            while end_idx > start_idx:
-                summary_row_text = ' '.join(str(cell).strip() for cell in df_full.iloc[end_idx] if pd.notna(cell))
-                if "Machine No" in summary_row_text and "Supervisor" in summary_row_text and "NAME" in summary_row_text:
-                    end_idx -= 1
-                else:
-                    break
-                    
-            sections.append({
-                'name': current_section,
-                'start': start_idx,
-                'end': end_idx,
-                'shift': 'Night' if is_night_shift else 'Day'
-            })
-            current_section = None
-            start_idx = None
-    
-    # Add last section if exists
-    if current_section and start_idx is not None:
-        # Find the actual end by looking for summary row
-        end_idx = len(df_full) - 1
-        while end_idx > start_idx:
-            summary_row_text = ' '.join(str(cell).strip() for cell in df_full.iloc[end_idx] if pd.notna(cell))
-            if "Machine No" in summary_row_text and "Supervisor" in summary_row_text and "NAME" in summary_row_text:
-                end_idx -= 1
-            else:
-                break
+        # Special handling for Amazon section
+        if "AMAZON" in row_text and "HOLWEG" in row_text:
+            if current_section and section_data:
+                processed_sections.append({
+                    'name': current_section,
+                    'data': pd.DataFrame(section_data),
+                    'shift': 'Night' if is_night_shift else 'Day'
+                })
+                section_data = []
+            current_section = "Amazon ( Holweg + Garant ) Machines"
+            continue
+        
+        # Process data rows
+        if not any(header in row_text for header in ['MACHINE NO', 'SUPERVISOR', 'SUMMARY', 'TOTAL']):
+            # Check for machine codes to determine section
+            first_cell = str(row.iloc[0]).upper().strip()
+            section_from_machine, machine_night_shift = get_section_for_machine(first_cell)
+            
+            if section_from_machine:
+                # If we find a new section from machine code, save current section data
+                if current_section and current_section != section_from_machine and section_data:
+                    processed_sections.append({
+                        'name': current_section,
+                        'data': pd.DataFrame(section_data),
+                        'shift': 'Night' if is_night_shift else 'Day'
+                    })
+                    section_data = []
                 
-        sections.append({
+                current_section = section_from_machine
+                is_night_shift = machine_night_shift or is_night_shift
+                section_data.append(row)
+            elif current_section:
+                section_data.append(row)
+    
+    # Add last section
+    if current_section and section_data:
+        processed_sections.append({
             'name': current_section,
-            'start': start_idx,
-            'end': end_idx,
+            'data': pd.DataFrame(section_data),
             'shift': 'Night' if is_night_shift else 'Day'
         })
     
-    return sections
+    return processed_sections
 
 def process_section_data(df_section: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
     """Process section DataFrame by cleaning and standardizing data"""
-    # Create a copy to avoid modifying the original
     df_section = df_section.copy()
     
-    # Filter out summary rows where Machine_No/Supervisor/NAME contains their column names
+    # Filter out summary rows, headers, and "Operator Cost per tonn"
     df_section = df_section[
         ~(
-            (df_section.iloc[:, 0].astype(str).str.contains('Machine No', case=False, na=False)) &
-            (df_section.iloc[:, 1].astype(str).str.contains('Supervisor', case=False, na=False)) &
-            (df_section.iloc[:, 2].astype(str).str.contains('NAME', case=False, na=False))
+            (df_section.iloc[:, 0].astype(str).str.contains('Machine No|Summary|Total|Operator Cost per tonn', case=False, na=False)) |
+            (df_section.iloc[:, 1].astype(str).str.contains('Supervisor|Summary|Total|Operator Cost per tonn', case=False, na=False)) |
+            (df_section.iloc[:, 2].astype(str).str.contains('NAME|Summary|Total|Operator Cost per tonn', case=False, na=False)) |
+            # Check all columns for "Operator Cost per tonn"
+            df_section.apply(lambda x: x.astype(str).str.contains('Operator Cost per tonn', case=False, na=False)).any(axis=1)
         )
     ]
+    
+    # Remove completely empty rows
+    df_section = df_section.dropna(how='all')
     
     # Rename columns
     for i, col in enumerate(columns):
         if i < len(df_section.columns):
             df_section.rename(columns={df_section.columns[i]: col}, inplace=True)
     
-    # Filter out rows where Machine_No equals "Machine No" (additional safety check)
-    df_section = df_section[df_section['Machine_No'] != 'Machine No']
-    
-    # Convert SAP_Code to string explicitly
-    if 'SAP_Code' in df_section.columns:
-        df_section['SAP_Code'] = df_section['SAP_Code'].fillna('').astype(str)
-    
     # Clean numeric columns
+    clean_numeric_columns(df_section)
+    
+    # Remove rows where Machine_No is missing or invalid
+    df_section = df_section[
+        df_section['Machine_No'].notna() & 
+        (df_section['Machine_No'].astype(str).str.strip() != '')
+    ]
+    
+    return df_section
+
+def clean_numeric_columns(df: pd.DataFrame) -> None:
+    """Clean numeric columns in the DataFrame"""
     numeric_columns = [
         'Hours', 'Operator_Cost', 'Net_Weight', 'Per_Pack', 'Bag_Produce',
         'Packet_Produce', 'In_Kgs', 'target_Bag_Produce', 'Pkt', 'KG_Target',
@@ -233,519 +222,622 @@ def process_section_data(df_section: pd.DataFrame, columns: List[str]) -> pd.Dat
     ]
     
     for col in numeric_columns:
-        if col in df_section.columns:
-            df_section[col] = pd.to_numeric(df_section[col], errors='coerce').fillna(0)
-    
-    return df_section
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-def aggregate_machine_data(df_list: List[pd.DataFrame]) -> pd.DataFrame:
-    """Aggregate data for each machine across multiple dates"""
-    if not df_list:
-        return pd.DataFrame()
-        
-    combined_df = pd.concat(df_list, ignore_index=True)
-    
-    # Group by machine number and aggregate
-    aggregated = combined_df.groupby('Machine_No').agg({
-        'Supervisor': 'first',
-        'NAME': 'first',
-        'Hours': 'sum',
-        'Operator_Cost': 'sum',
-        'SAP_Code': 'first',
-        'Net_Weight': 'mean',
-        'Size': 'first',
-        'Material_Description': 'first',
-        'Per_Pack': 'sum',
-        'Bag_Produce': 'sum',
-        'Packet_Produce': 'sum',
-        'In_Kgs': 'sum',
-        'target_Bag_Produce': 'sum',
-        'Pkt': 'sum',
-        'KG_Target': 'sum',
-        'Production_Date': list
-    }).reset_index()
-    
-    # Calculate efficiency percentages
-    aggregated['Pkt_Var_%'] = (aggregated['Packet_Produce'] / aggregated['Pkt'] * 100).round(2)
-    aggregated['KG_Variance_%'] = (aggregated['In_Kgs'] / aggregated['KG_Target'] * 100).round(2)
-    
-    return aggregated
-
-def calculate_ref_speed(section_summary):
-    """Calculate reference speed based on weighted production rates"""
-    production = section_summary['production']['total_packets']
-    hours = section_summary['total_hours']
-    return (production / (hours * 60)) if hours > 0 else 0
-
-def get_actual_manhours(section_name):
-    """Get predefined actual manhours for specific sections"""
-    # Remove shift information from section name
-    base_section = section_name.split(' (')[0].upper()
-    manhours_map = {
-        'BEASLEY DAY SHIFT PRODUCTION': 2010,
-        'SOS SECTION': 810,
-        'GARANT SECTION': 495,
-        'SHEETER SECTION': 120,
-        'HANDLE SECTION': 285
+def add_summary_row(df: pd.DataFrame) -> pd.DataFrame:
+    """Add a summary row to the dataframe with specified calculations"""
+    summary_row = {
+        'Machine_No': f"Total Unique Machines: {df['Machine_No'].nunique()}",
+        'Supervisor': 'SUMMARY',
+        'Hours': df['Hours'].sum(),
+        'Operator_Cost': df['Operator_Cost'].sum(),
+        'NAME': 'TOTAL',
+        'SAP_Code': '',
+        'Net_Weight': df['Net_Weight'].mean(),  # Average net weight
+        'Size': '',
+        'Material_Description': '',
+        'Per_Pack': df['Per_Pack'].sum(),
+        'Bag_Produce': df['Bag_Produce'].sum(),
+        'Packet_Produce': df['Packet_Produce'].sum(),
+        'In_Kgs': df['In_Kgs'].sum(),
+        'target_Bag_Produce': df['target_Bag_Produce'].sum(),
+        'Pkt': df['Pkt'].sum(),
+        'KG_Target': df['KG_Target'].sum()
     }
-    return manhours_map.get(base_section)
+    
+    # Create summary DataFrame
+    summary_df = pd.DataFrame([summary_row])
+    
+    # Add any additional columns that might be in the original DataFrame
+    for col in df.columns:
+        if col not in summary_df.columns:
+            summary_df[col] = ''
+    
+    # Combine original data with summary row
+    return pd.concat([df, summary_df], ignore_index=True)
 
-def transform_to_capacity_report(sections_analysis: Dict[str, Any]) -> pd.DataFrame:
-    """Transform section analysis data into capacity report format with updated calculations"""
-    # Factory parameters
-    FACTORY_SHIFT_PATTERN = 110
-    WORKING_DAYS_RATIO = 22 / 30
-    FIXED_MC_HOURS = 60
+def transform_to_capacity_report(sections_with_summary: Dict[Tuple[str, str], pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Transform section analysis data into capacity report format matching EFESO template"""
+    # Use section sequence and identifiers from template.py
+    section_sequence = [
+        "BEASLEY DAY SHIFT PRODUCTION",
+        "SOS SECTION",
+        "Amazon ( Holweg + Garant ) Machines",
+        "GARANT SECTION",
+        "HANDLE SECTION",
+        "MATADOR SECTION",
+        "WICKETTING SECTION",
+        "SHEETER SECTION",
+        "DAILY PRODUCTION REPORT (NIGHT SHIFT)",
+        "BEASLEY SECTION",
+        "MATADOR SECTION",
+        "SOS SECTION",
+        "GARANT SECTION",
+        "SHEETER SECTION",
+        "Amazon ( Holweg + Garant ) Machines",
+        "HANDLE SECTION"
+    ]
     
-    report_data = []
-    processed_sections = set()  # Track processed sections to avoid duplicates
+    # Define section identifiers with variations
+    section_identifiers = {
+        "BEASLEY DAY SHIFT PRODUCTION": ["BEASLEY", "B-"],
+        "SOS SECTION": ["SOS", "CH-"],
+        "Amazon ( Holweg + Garant ) Machines": ["AMAZON", "HOLWEG", "GARANT MACHINES", "AMAZON ( HOLWEG", "HOLWEG + GARANT"],
+        "GARANT SECTION": ["GARANT SECTION"],
+        "HANDLE SECTION": ["HANDLE"],
+        "MATADOR SECTION": ["MATADOR"],
+        "WICKETTING SECTION": ["WICKETTING"],
+        "SHEETER SECTION": ["SHEETER"],
+        "BEASLEY SECTION": ["BEASLEY", "B-"],
+        "DAILY PRODUCTION REPORT (NIGHT SHIFT)": ["NIGHT SHIFT", "NIGHT PRODUCTION"]
+    }
     
-    for section_name, analysis in sections_analysis.items():
-        # Extract base section name (without shift)
-        base_section = section_name.split(' (')[0]
-        
-        # Skip if we've already processed this base section
-        if base_section in processed_sections:
-            continue
-            
-        processed_sections.add(base_section)
-        
-        # Basic metrics
-        machines = analysis['summary']['total_machines']
-        actual_hours = analysis['summary']['total_hours']
-        
-        # Calculate weekly volume with working days ratio
-        weekly_volume = analysis['summary']['production']['total_packets'] * WORKING_DAYS_RATIO
-        
-        # Calculate reference speed
-        ref_speed = calculate_ref_speed(analysis['summary'])
-        
-        # Calculate value adding hours
-        value_adding_hours = (weekly_volume / (ref_speed * 60)) / machines if (ref_speed > 0 and machines > 0) else 0
-        
-        # Get actual manhours from mapping or use calculated value
-        actual_manhours = get_actual_manhours(base_section) or actual_hours
-        
-        # Calculate direct operators per machine/shift
-        total_operators_hours = sum(
-            detail.get('hours', 0) for detail in analysis['machine_details']
-        )
-        dir_per_shift = (total_operators_hours / actual_hours) if actual_hours > 0 else 0
-        
-        # Calculate required manhours
-        required_manhours = dir_per_shift * FIXED_MC_HOURS * machines
-        
-        # Calculate organizational losses
-        org_losses = (actual_manhours / required_manhours - 1) if required_manhours > 0 else None
-        
-        row = {
-            'Process': base_section,
-            '# Mach. Avail.': machines,
-            'Production Volume (Weekly)': weekly_volume,
-            'Meas. Unit': 'pk',
-            'Value Adding Mc Hours / Week / Mc': value_adding_hours,
-            'Ref Speed (Meas. Unit per min)': ref_speed,
-            'Actual OEE': value_adding_hours / FIXED_MC_HOURS if FIXED_MC_HOURS > 0 else None,
-            'Actual Mc Hours / Week / Mc': FIXED_MC_HOURS,
-            'Saturation vs. 110 hrs/wk': (FIXED_MC_HOURS / FACTORY_SHIFT_PATTERN) * 100,
-            'Dir op/ mach /shift': 1,  # Fixed to 1 as per requirements
-            'Required Manhours/ Week': required_manhours,
-            'Actual Manhours/ Week': actual_manhours,
-            'Org. Losses': org_losses,
-            '% Overtime': 3.0,
-            '% Absence': 2.0,
-            'Actual No of Dir Ops': machines * 1  # Using fixed dir_per_shift of 1
-        }
-        report_data.append(row)
+    # Get unique sections for the report
+    unique_sections = []
+    seen_sections = set()
+    for section in section_sequence:
+        base_section = section.split("(")[0].strip()  # Remove shift indicators
+        if base_section not in seen_sections and base_section != "DAILY PRODUCTION REPORT":
+            unique_sections.append(base_section)
+            seen_sections.add(base_section)
     
-    # Create DataFrame and sort by Process name
-    df = pd.DataFrame(report_data)
-    df = df.sort_values('Process')
+    # Add Total to the sections
+    processes = unique_sections + ["Total"]
     
+    # Initialize data structures for each section
+    combined_sections = {process: {
+        'machines': 0,
+        'weekly_volume': 0,
+        'actual_hours': 0,
+        'efficiency_sum': 0,
+        'efficiency_count': 0,
+        'total_manhours': 0,
+        'total_target': 0
+    } for process in processes[:-1]}  # Exclude Total
     
+    # Helper function to get base section name
+    def get_base_section(section_name: str) -> str:
+        for base_section, identifiers in section_identifiers.items():
+            if any(identifier in section_name.upper() for identifier in identifiers):
+                return base_section.split("(")[0].strip()
+        return section_name.split("(")[0].strip()
     
-    return df
+    # Process data from sections
+    for (section_name, shift), data in sections_with_summary.items():
+        base_section = get_base_section(section_name)
+        if base_section in combined_sections:
+            section = combined_sections[base_section]
+            section['machines'] = max(section['machines'], data['Machine_No'].nunique())
+            section['weekly_volume'] += data['Packet_Produce'].sum()
+            section['actual_hours'] += data['Hours'].sum()
+            section['total_target'] += data['Pkt'].sum()
+            efficiency = (data['Packet_Produce'].sum() / data['Pkt'].sum() * 100) if data['Pkt'].sum() > 0 else 0
+            section['efficiency_sum'] += efficiency
+            section['efficiency_count'] += 1
+            section['total_manhours'] += data['Hours'].sum()
+    
+    # Create capacity and labour data structures
+    capacity_data = {
+        'Process': processes,
+        '# Mach. Avail.': [],
+        'Production Volume (Weekly)': [],
+        'Meas. Unit': [],
+        'Value Adding Mc Hours/Week/Mc': [],
+        'Ref Speed (Meas. Unit per min)': [],
+        'Actual OEE': [],
+        'Actual Mc Hours/Week/Mc': [],
+        'Saturation vs. 110 hrs/wk': []
+    }
+    
+    labour_data = {
+        'Dir op/mach/shift': [],
+        'Required Manhours/Week': [],
+        'Actual Manhours/Week': [],
+        'Org. Losses': [],
+        '% Overtime': [],
+        '% Absence': [],
+        'Actual No of Dir Ops': []
+    }
+    
+    # Calculate totals
+    total_machines = 0
+    total_volume = 0
+    total_manhours_required = 0
+    total_manhours_actual = 0
+    total_ops = 0
+    
+    # Fill data for each process
+    for process in processes[:-1]:
+        data = combined_sections[process]
+        machines = data['machines']
+        total_machines += machines
+        
+        weekly_volume = data['weekly_volume']
+        total_volume += weekly_volume
+        
+        actual_hours = data['actual_hours']
+        target_volume = data['total_target']
+        
+        # Capacity calculations
+        value_adding_hours = actual_hours / machines if machines > 0 else 0
+        ref_speed = weekly_volume / (actual_hours * 60) if actual_hours > 0 else 0
+        oee = (weekly_volume / target_volume * 100) if target_volume > 0 else 0
+        
+        # Labour calculations
+        dir_per_shift = 2.0 if process == "SHEETER SECTION" else 1.0
+        required_manhours = machines * 40  # 40 hours per machine per week
+        actual_manhours = data['total_manhours']
+        org_losses = ((actual_manhours - required_manhours) / required_manhours) if required_manhours > 0 else 0
+        actual_ops = machines * dir_per_shift
+        
+        # Update totals
+        total_manhours_required += required_manhours
+        total_manhours_actual += actual_manhours
+        total_ops += actual_ops
+        
+        # Add to capacity data
+        capacity_data['# Mach. Avail.'].append(machines)
+        capacity_data['Production Volume (Weekly)'].append(weekly_volume)
+        capacity_data['Meas. Unit'].append('kg' if process == "GARANT SECTION" else 'pk')
+        capacity_data['Value Adding Mc Hours/Week/Mc'].append(value_adding_hours)
+        capacity_data['Ref Speed (Meas. Unit per min)'].append(ref_speed)
+        capacity_data['Actual OEE'].append(oee)
+        capacity_data['Actual Mc Hours/Week/Mc'].append(60)
+        capacity_data['Saturation vs. 110 hrs/wk'].append(0.55)
+        
+        # Add to labour data
+        labour_data['Dir op/mach/shift'].append(dir_per_shift)
+        labour_data['Required Manhours/Week'].append(required_manhours)
+        labour_data['Actual Manhours/Week'].append(actual_manhours)
+        labour_data['Org. Losses'].append(org_losses)
+        labour_data['% Overtime'].append(0.03)
+        labour_data['% Absence'].append(0.02)
+        labour_data['Actual No of Dir Ops'].append(actual_ops)
+    
+    # Add totals row
+    capacity_data['# Mach. Avail.'].append(total_machines)
+    capacity_data['Production Volume (Weekly)'].append(total_volume)
+    capacity_data['Meas. Unit'].append('')
+    capacity_data['Value Adding Mc Hours/Week/Mc'].append('')
+    capacity_data['Ref Speed (Meas. Unit per min)'].append('')
+    avg_oee = sum(capacity_data['Actual OEE'][:-1]) / len(processes[:-1]) if processes[:-1] else 0
+    capacity_data['Actual OEE'].append(avg_oee)
+    capacity_data['Actual Mc Hours/Week/Mc'].append('')
+    capacity_data['Saturation vs. 110 hrs/wk'].append(0.55)
+    
+    labour_data['Dir op/mach/shift'].append('')
+    labour_data['Required Manhours/Week'].append(total_manhours_required)
+    labour_data['Actual Manhours/Week'].append(total_manhours_actual)
+    labour_data['Org. Losses'].append((total_manhours_actual - total_manhours_required) / total_manhours_required if total_manhours_required > 0 else 0)
+    labour_data['% Overtime'].append(0.03)
+    labour_data['% Absence'].append(0.02)
+    labour_data['Actual No of Dir Ops'].append(total_ops)
+    
+    return pd.DataFrame(capacity_data), pd.DataFrame(labour_data)
 
-def generate_claude_analysis(sections_analysis: Dict[str, Any]) -> str:
-    """Generate AI analysis using Claude"""
-    section_summaries = []
-    for section_name, analysis in sections_analysis.items():
-        summary = (
-            f"Section: {section_name}\n"
-            f"Machines: {analysis['summary']['total_machines']}\n"
-            f"Hours: {analysis['summary']['total_hours']:.2f}\n"
-            f"Production Volume: {analysis['summary']['production']['total_packets']:,.0f} packets\n"
-            f"Efficiency: {analysis['performance']['average_efficiency']:.1f}%"
-        )
-        section_summaries.append(summary)
+def export_capacity_report(capacity_df: pd.DataFrame, labour_df: pd.DataFrame, file_date: str = None) -> bytes:
+    """Export capacity report in EFESO template format"""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Process Data"
     
-    prompt = (
-        "Analyze the following production data and provide insights on efficiency, "
-        "capacity utilization, and potential improvements:\n\n"
-        f"{chr(10).join(section_summaries)}\n\n"
-        "Consider:\n"
-        "1. Overall equipment effectiveness\n"
-        "2. Resource utilization\n"
-        "3. Bottlenecks and constraints\n"
-        "4. Improvement opportunities"
+    # Insert logo
+    ws.insert_rows(1)
+    ws.merge_cells('A1:B1')
+    logo_cell = ws['A1']
+    logo_cell.value = "EFESO Consulting"
+    logo_cell.font = Font(bold=True)
+    
+    # Insert date header
+    ws.insert_rows(2, 1)
+    date_text = f"Start Point ({file_date})" if file_date else "Start Point"
+    ws['A3'] = date_text
+    ws.merge_cells('A3:P3')
+    ws['A3'].fill = PatternFill(start_color='C0C0C0', end_color='C0C0C0', fill_type='solid')
+    ws['A3'].font = Font(bold=True)
+    ws['A3'].alignment = Alignment(horizontal='center')
+    
+    # Add section headers
+    ws['A4'] = "Process"
+    ws['B4'] = "CAPACITY"
+    ws['J4'] = "LABOUR"
+    
+    # Merge cells for sections
+    ws.merge_cells('B4:I4')
+    ws.merge_cells('J4:P4')
+    
+    # Style section headers
+    for cell in [ws['A4'], ws['B4'], ws['J4']]:
+        cell.fill = PatternFill(start_color='C0C0C0', end_color='C0C0C0', fill_type='solid')
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='center')
+    
+    # Write column headers and data
+    capacity_headers = ['Process'] + list(capacity_df.columns[1:])
+    labour_headers = list(labour_df.columns)
+    
+    # Write headers
+    for idx, header in enumerate(capacity_headers + labour_headers, 1):
+        ws.cell(row=5, column=idx, value=header)
+    
+    # Write data
+    for row_idx, (cap_row, lab_row) in enumerate(zip(capacity_df.values, labour_df.values), 6):
+        for col_idx, value in enumerate(cap_row, 1):
+            ws.cell(row=row_idx, column=col_idx, value=value)
+        for col_idx, value in enumerate(lab_row, len(cap_row) + 1):
+            ws.cell(row=row_idx, column=col_idx, value=value)
+    
+    # Style the sheet
+    style_excel_sheet(wb)
+    
+    # Save to bytes
+    output = BytesIO()
+    wb.save(output)
+    return output.getvalue()
+
+def style_excel_sheet(wb):
+    """Style the Excel worksheet according to EFESO template"""
+    ws = wb.active
+    
+    # Style borders
+    thin_border = Border(
+        left=Side(style='thin'), 
+        right=Side(style='thin'),
+        top=Side(style='thin'), 
+        bottom=Side(style='thin')
     )
-
-    try:
-        response = anthropic.messages.create(
-            model="claude-3-haiku-20240307",
-            max_tokens=1000,
-            system="You are a production analysis expert. Provide concise, actionable insights.",
-            messages=[{
-                "role": "user",
-                "content": prompt
-            }]
-        )
-        return response.content
-    except Exception as e:
-        logger.error(f"Error getting Claude analysis: {e}")
-        return "Error generating analysis. Please try again."
-
-def analyze_production_data(sections_data: Dict[str, pd.DataFrame], date_range: str) -> Dict[str, Any]:
-    """Analyze aggregated production data for each section"""
-    sections_analysis = {}
     
-    for section_key, df in sections_data.items():
-        analysis = {
-            'date_range': date_range,
-            'section_name': section_key,
-            'summary': {
-                'total_machines': len(df['Machine_No'].unique()),
-                'total_hours': df['Hours'].sum(),
-                'total_operator_cost': df['Operator_Cost'].sum(),
-                'production': {
-                    'total_per_pack': df['Per_Pack'].sum(),
-                    'total_bags': df['Bag_Produce'].sum(),
-                    'total_packets': df['Packet_Produce'].sum(),
-                    'total_kgs': df['In_Kgs'].sum(),
-                },
-                'targets': {
-                    'total_bag_target': df['target_Bag_Produce'].sum(),
-                    'total_pkt_target': df['Pkt'].sum(),
-                    'total_kg_target': df['KG_Target'].sum(),
-                }
-            },
-            'performance': {
-                'average_efficiency': df['Pkt_Var_%'].mean(),
-                'machines_above_target': len(df[df['Pkt_Var_%'] > 100]),
-                'machines_below_target': len(df[df['Pkt_Var_%'] <= 100]),
-            },
-            'machine_details': []
-        }
-        
-        for _, row in df.iterrows():
-            machine_data = {
-                'machine_no': row['Machine_No'],
-                'supervisor': row['Supervisor'],
-                'operator': row['NAME'],
-                'hours': row['Hours'],
-                'operator_cost': row['Operator_Cost'],
-                'production': {
-                    'per_pack': row['Per_Pack'],
-                    'bags': row['Bag_Produce'],
-                    'packets': row['Packet_Produce'],
-                    'kgs': row['In_Kgs']
-                },
-                'material': {
-                    'sap_code': row['SAP_Code'],
-                    'net_weight': row['Net_Weight'],
-                    'size': row['Size'],
-                    'description': row['Material_Description']
-                },
-                'targets': {
-                    'bag_target': row['target_Bag_Produce'],
-                    'pkt_target': row['Pkt'],
-                    'kg_target': row['KG_Target']
-                },
-                'dates': row['Production_Date'],
-                'efficiency': row['Pkt_Var_%'],
-                'kg_efficiency': row['KG_Variance_%']
-            }
-            analysis['machine_details'].append(machine_data)
-        
-        sections_analysis[section_key] = analysis
+    for row in ws.rows:
+        for cell in row:
+            cell.border = thin_border
+            if cell.row > 5:  # Don't center the headers
+                cell.alignment = Alignment(horizontal='center', vertical='center')
     
-    return sections_analysis
-
-def read_production_data(uploaded_files: List[Any], max_sheets: int) -> Tuple[Dict[str, pd.DataFrame], List[Any], int, Dict[str, int]]:
-    """Read and process production data from uploaded files"""
-    try:
-        all_sections = {}
-        all_dates = set()
-        file_stats = {
-            'total_files': len(uploaded_files),
-            'processed_files': 0,
-            'total_sheets': 0,
-            'processed_sheets': 0
-        }
-        
-        # Count total sheets first
-        for uploaded_file in uploaded_files:
+    # Style process names
+    light_blue = PatternFill(start_color='B8CCE4', end_color='B8CCE4', fill_type='solid')
+    for row in range(6, ws.max_row + 1):  # Start from row 6 (first data row)
+        if ws[f'A{row}'].value in ['Beasley', 'SOS', 'Film Front', 'Sheeter', 'Handle', 'Printer', 'Wicketing']:
+            ws[f'A{row}'].fill = light_blue
+            ws[f'A{row}'].font = Font(color='0000FF')  # Blue text
+    
+    # Style totals row
+    yellow_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
+    for cell in ws[ws.max_row]:
+        if cell.value is not None:
+            cell.fill = yellow_fill
+    
+    # Format percentage cells
+    percentage_columns = ['% Overtime', '% Absence']
+    for col in ws.columns:
+        header = col[4].value  # Get column header
+        if header in percentage_columns:
+            for cell in col[5:]:  # Start after header
+                if isinstance(cell.value, (int, float)):
+                    cell.number_format = '0.0%'
+    
+    # Set column widths
+    for column in ws.columns:
+        max_length = 0
+        column = list(column)
+        for cell in column:
             try:
-                excel_file = read_file(uploaded_file)
-                file_stats['total_sheets'] += len(excel_file.sheet_names)
-            except Exception as e:
-                logger.warning(f"Error counting sheets in {uploaded_file.name}: {e}")
-            finally:
-                # Reset file position for later reading
-                uploaded_file.seek(0)
-        
-        sheets_data, skipped_sheets = batch_process_sheets(uploaded_files, max_sheets, file_stats)
-        section_data_collection = {}
-        
-        columns = [
-            'Machine_No', 'Supervisor', 'Hours', 'Operator_Cost', 'NAME', 'SAP_Code',
-            'Net_Weight', 'Size', 'Material_Description', 'Per_Pack', 'Bag_Produce',
-            'Packet_Produce', 'In_Kgs', 'target_Bag_Produce', 'Pkt', 'KG_Target',
-            'Pkt_Var_%', 'KG_Variance_%'
-        ]
-        
-        for df_full, production_date in sheets_data:
-            sections = identify_sections(df_full)
-            if isinstance(production_date, str):
-                try:
-                    # Try to parse the date if it's a string
-                    production_date = pd.to_datetime(production_date)
-                except:
-                    pass
-            all_dates.add(production_date)
-            
-            for section in sections:
-                section_key = f"{section['name']} ({section['shift']})"
-                df_section = df_full.iloc[section['start']:section['end']].copy()
-                
-                if not df_section.empty:
-                    df_section = process_section_data(df_section, columns)
-                    df_section['Production_Date'] = production_date
-                    
-                    if section_key not in section_data_collection:
-                        section_data_collection[section_key] = []
-                    section_data_collection[section_key].append(df_section)
-        
-        # Aggregate data for each section
-        for section_key, df_list in section_data_collection.items():
-            all_sections[section_key] = aggregate_machine_data(df_list)
-        
-        return all_sections, sorted(list(all_dates)), skipped_sheets, file_stats
-    
-    except Exception as e:
-        logger.error(f"Error reading production data: {e}")
-        raise Exception(f"Error reading production data: {e}")
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = (max_length + 2)
+        ws.column_dimensions[get_column_letter(column[0].column)].width = adjusted_width
 
 def main():
-    """Main Streamlit application"""
     st.set_page_config(
-        page_title="Capacity Labour Analysis Dashboard",
+        page_title="Production Analysis Dashboard",
         page_icon="📊",
         layout="wide"
     )
     
-    st.title("Capacity Labour Dashboard")
-    st.write("Upload production files for analysis")
+    st.title("Production Analysis Dashboard")
     
-    # Add configuration section
-    with st.expander("Configuration", expanded=True):
-        max_sheets = st.number_input(
-            "Maximum number of sheets to process",
+    # Initialize sections_with_summary at the start
+    sections_with_summary = {}
+    
+    # File upload and configuration section
+    with st.sidebar:
+        st.header("Upload Settings")
+        batch_size = st.number_input(
+            "Batch Size (sheets per process)",
             min_value=1,
             max_value=1000,
-            value=28,
-            help="Set the maximum number of sheets to process from all uploaded files. Higher numbers will take longer to process."
+            value=50,
+            help="Number of sheets to process in each batch"
         )
+        
+        show_progress = st.checkbox("Show Detailed Progress", value=True)
     
     uploaded_files = st.file_uploader(
-        "Choose files",
-        type=['xlsx', 'xls', 'xlsm', 'xlsb', 'odf', 'ods', 'odt', 'csv'],
-        accept_multiple_files=True,
-        key="file_uploader"
+        "Upload production files (Excel/CSV)",
+        type=['xlsx', 'xls', 'csv'],
+        accept_multiple_files=True
     )
     
     if uploaded_files:
         try:
-            with st.spinner('Processing production data...'):
-                # Read and process the uploaded files with user-defined limit
-                sections_data, date_range, skipped_sheets, file_stats = read_production_data(uploaded_files, max_sheets)
+            # Initialize progress tracking
+            if show_progress:
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+            
+            # Count total sheets
+            total_sheets = 0
+            file_info = []
+            for file in uploaded_files:
+                try:
+                    excel_file = read_file(file)
+                    n_sheets = len(excel_file.sheet_names)
+                    total_sheets += n_sheets
+                    file_info.append((file, n_sheets))
+                except Exception as e:
+                    logger.warning(f"Error counting sheets in {file.name}: {e}")
+                finally:
+                    file.seek(0)
+            
+            if show_progress:
+                st.info(f"Found {total_sheets} sheets in {len(uploaded_files)} files")
+            
+            # Process files in batches
+            all_sections_data = []
+            processed_sheets = 0
+            
+            for file, n_sheets in file_info:
+                try:
+                    excel_file = read_file(file)
+                    
+                    # Process sheets in batches
+                    for i in range(0, n_sheets, batch_size):
+                        batch_sheets = excel_file.sheet_names[i:i + batch_size]
+                        
+                        for sheet_name in batch_sheets:
+                            if show_progress:
+                                status_text.text(f"Processing {file.name} - Sheet: {sheet_name}")
+                                progress_bar.progress(processed_sheets / total_sheets)
+                            
+                            try:
+                                df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                                sections = process_file_by_sections(df)
+                                
+                                for section in sections:
+                                    if not section['data'].empty:
+                                        columns = [
+                                            'Machine_No', 'Supervisor', 'Hours', 'Operator_Cost',
+                                            'NAME', 'SAP_Code', 'Net_Weight', 'Size',
+                                            'Material_Description', 'Per_Pack', 'Bag_Produce',
+                                            'Packet_Produce', 'In_Kgs', 'target_Bag_Produce',
+                                            'Pkt', 'KG_Target'
+                                        ]
+                                        processed_df = process_section_data(section['data'], columns)
+                                        processed_df['Section'] = section['name']
+                                        processed_df['Shift'] = section['shift']
+                                        processed_df['File'] = file.name
+                                        processed_df['Sheet'] = sheet_name
+                                        all_sections_data.append(processed_df)
+                                
+                                processed_sheets += 1
+                                
+                            except Exception as e:
+                                logger.warning(f"Error processing sheet {sheet_name} in {file.name}: {e}")
+                                continue
+                            
+                except Exception as e:
+                    logger.warning(f"Error processing file {file.name}: {e}")
+                    continue
+            
+            if show_progress:
+                progress_bar.progress(1.0)
+                status_text.text("Processing complete!")
+            
+            if all_sections_data:
+                # Create final dataframe
+                final_df = pd.concat(all_sections_data, ignore_index=True)
                 
-                # Display file processing statistics
-                st.success(f"Successfully processed {file_stats['processed_files']} files containing {file_stats['processed_sheets']} sheets")
+                # Group by section and shift
+                grouped = final_df.groupby(['Section', 'Shift'])
                 
-                if skipped_sheets > 0:
-                    st.warning(f"Skipped {skipped_sheets} sheets due to reaching the configured limit of {max_sheets} sheets")
+                # Create sections_with_summary dictionary
+                sections_with_summary = {
+                    (section_name, shift): group_data
+                    for (section_name, shift), group_data in grouped
+                }
                 
-                # Display date range with proper formatting
-                st.subheader("Analysis Period")
-                date_col1, date_col2 = st.columns(2)
-                with date_col1:
-                    start_date = min(date_range)
-                    if isinstance(start_date, pd.Timestamp):
-                        start_date = start_date.strftime('%Y-%m-%d')
-                    st.write(f"Start Date: {start_date}")
-                with date_col2:
-                    end_date = max(date_range)
-                    if isinstance(end_date, pd.Timestamp):
-                        end_date = end_date.strftime('%Y-%m-%d')
-                    st.write(f"End Date: {end_date}")
+                # Display summary statistics
+                st.subheader("Processing Summary:")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Files Processed", len(uploaded_files))
+                with col2:
+                    st.metric("Sheets Processed", processed_sheets)
+                with col3:
+                    st.metric("Sections Found", len(grouped))
                 
-                # Generate analysis for all sections
-                sections_analysis = analyze_production_data(
-                    sections_data,
-                    f"{min(date_range)} - {max(date_range)}"
+                # Display sections and their data with summary rows
+                st.subheader("Sections and Their Data:")
+                
+                for (section_name, shift), group_data in grouped:
+                    # Add summary row to the group data
+                    group_with_summary = add_summary_row(group_data)
+                    sections_with_summary[(section_name, shift)] = group_with_summary
+                    
+                    with st.expander(f"{section_name} ({shift})", expanded=True):
+                        st.dataframe(
+                            group_with_summary.drop(['Section', 'Shift'], axis=1),
+                            use_container_width=True
+                        )
+                
+                # Download options
+                st.subheader("Download Options")
+                col1, col2 = st.columns(2)
+                
+                # Prepare Excel file with multiple sheets including summary rows
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                    # Summary sheet
+                    summary_data = {
+                        'Section': [],
+                        'Shift': [],
+                        'Total Unique Machines': [],
+                        'Total Hours': [],
+                        'Total Operator Cost': [],
+                        'Total Per Pack': [],
+                        'Total Bag Produce': [],
+                        'Total Packet Produce': [],
+                        'Total In Kgs': [],
+                        'Total Target Bag Produce': [],
+                        'Total Pkt': [],
+                        'Total KG Target': []
+                    }
+                    
+                    # Write each section to a separate sheet
+                    for (section_name, shift), group_data in sections_with_summary.items():
+                        # Add to summary
+                        summary_data['Section'].append(section_name)
+                        summary_data['Shift'].append(shift)
+                        summary_data['Total Unique Machines'].append(group_data['Machine_No'].nunique())
+                        summary_data['Total Hours'].append(group_data['Hours'].sum())
+                        summary_data['Total Operator Cost'].append(group_data['Operator_Cost'].sum())
+                        summary_data['Total Per Pack'].append(group_data['Per_Pack'].sum())
+                        summary_data['Total Bag Produce'].append(group_data['Bag_Produce'].sum())
+                        summary_data['Total Packet Produce'].append(group_data['Packet_Produce'].sum())
+                        summary_data['Total In Kgs'].append(group_data['In_Kgs'].sum())
+                        summary_data['Total Target Bag Produce'].append(group_data['target_Bag_Produce'].sum())
+                        summary_data['Total Pkt'].append(group_data['Pkt'].sum())
+                        summary_data['Total KG Target'].append(group_data['KG_Target'].sum())
+                        
+                        # Write section data with summary row
+                        sheet_name = f"{section_name[:20]}_{shift}"
+                        group_data.to_excel(writer, sheet_name=sheet_name, index=False)
+                        
+                        # Format sheet
+                        worksheet = writer.sheets[sheet_name]
+                        header_format = writer.book.add_format({
+                            'bold': True,
+                            'bg_color': '#D3D3D3'
+                        })
+                        summary_format = writer.book.add_format({
+                            'bold': True,
+                            'bg_color': '#FFE4B5'  # Light orange for summary row
+                        })
+                        
+                        # Format headers
+                        for col_num, value in enumerate(group_data.columns.values):
+                            worksheet.write(0, col_num, value, header_format)
+                        
+                        # Format summary row
+                        last_row = len(group_data)
+                        for col_num in range(len(group_data.columns)):
+                            worksheet.write(last_row, col_num, 
+                                         group_data.iloc[-1][group_data.columns[col_num]], 
+                                         summary_format)
+                    
+                    # Write summary sheet
+                    summary_df = pd.DataFrame(summary_data)
+                    summary_df.to_excel(writer, sheet_name='Summary', index=False)
+                    
+                    # Format summary sheet
+                    summary_sheet = writer.sheets['Summary']
+                    for col_num, value in enumerate(summary_df.columns.values):
+                        summary_sheet.write(0, col_num, value, header_format)
+                
+                with col1:
+                    st.download_button(
+                        label="Download Full Report (Excel)",
+                        data=buffer.getvalue(),
+                        file_name="production_data_report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                
+                with col2:
+                    # Prepare CSV of all data including summary rows
+                    csv_buffer = io.StringIO()
+                    pd.concat(sections_with_summary.values(), ignore_index=True).to_csv(csv_buffer, index=False)
+                    st.download_button(
+                        label="Download All Data (CSV)",
+                        data=csv_buffer.getvalue(),
+                        file_name="production_data.csv",
+                        mime="text/csv"
+                    )
+            else:
+                st.warning("No data was processed. Please check your input files.")
+                
+        except Exception as e:
+            st.error(f"Error processing files: {str(e)}")
+            logger.error(f"Processing error: {str(e)}", exc_info=True)
+
+    # Add capacity report generation section
+    with st.expander("Generate Capacity Report", expanded=False):
+        st.info("Generate a capacity report in EFESO template format")
+        
+        # Get the date from the first file name if available
+        file_date = None
+        if uploaded_files:
+            try:
+                first_file = uploaded_files[0].name
+                # Try to extract date from filename (assuming format contains YYYYMMDD)
+                import re
+                date_match = re.search(r'(\d{8})', first_file)
+                if date_match:
+                    date_str = date_match.group(1)
+                    file_date = datetime.strptime(date_str, '%Y%m%d').strftime('%Y-%m-%d')
+            except:
+                pass
+        
+        if sections_with_summary:
+            try:
+                # Generate capacity report
+                capacity_df, labour_df = transform_to_capacity_report(sections_with_summary)
+                
+                # Display preview
+                st.subheader("Capacity Report Preview")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write("Capacity Data")
+                    st.dataframe(capacity_df)
+                with col2:
+                    st.write("Labour Data")
+                    st.dataframe(labour_df)
+                
+                # Export button
+                report_bytes = export_capacity_report(capacity_df, labour_df, file_date)
+                st.download_button(
+                    label="Download Capacity Report (Excel)",
+                    data=report_bytes,
+                    file_name=f"capacity_report_{file_date or 'generated'}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
                 
-                # Create tabs for different views
-                tab1, tab2, tab3, tab4 = st.tabs([
-                    "Section Overview", 
-                    "Machine Details", 
-                    "Capacity Report",
-                    "AI Analysis"
-                ])
-                
-                with tab1:
-                    st.subheader("Section Performance Overview")
-                    for section_name, analysis in sections_analysis.items():
-                        with st.expander(f"{section_name}", expanded=True):
-                            col1, col2, col3 = st.columns(3)
-                            
-                            with col1:
-                                st.metric(
-                                    "Total Machines", 
-                                    analysis['summary']['total_machines']
-                                )
-                                st.metric(
-                                    "Total Hours", 
-                                    f"{analysis['summary']['total_hours']:,.1f}"
-                                )
-                                
-                            with col2:
-                                st.metric(
-                                    "Total Packets", 
-                                    f"{analysis['summary']['production']['total_packets']:,.0f}"
-                                )
-                                st.metric(
-                                    "Average Efficiency", 
-                                    f"{analysis['performance']['average_efficiency']:.1f}%"
-                                )
-                                
-                            with col3:
-                                st.metric(
-                                    "Machines Above Target", 
-                                    analysis['performance']['machines_above_target']
-                                )
-                                st.metric(
-                                    "Machines Below Target", 
-                                    analysis['performance']['machines_below_target']
-                                )
-                
-                with tab2:
-                    st.subheader("Machine Details")
-                    selected_section = st.selectbox(
-                        "Select Section",
-                        options=list(sections_data.keys()),
-                        key="section_selector"
-                    )
-                    
-                    if selected_section:
-                        # Display machine data
-                        machine_data = sections_data[selected_section]
-                        st.dataframe(
-                            machine_data,
-                            use_container_width=True,
-                            height=400
-                        )
-                        
-                        # Create efficiency charts
-                        chart_col1, chart_col2 = st.columns(2)
-                        
-                        with chart_col1:
-                            st.subheader("Packet Efficiency by Machine")
-                            efficiency_chart = pd.DataFrame({
-                                'Machine': machine_data['Machine_No'],
-                                'Efficiency (%)': machine_data['Pkt_Var_%']
-                            }).set_index('Machine')
-                            st.bar_chart(efficiency_chart)
-                        
-                        with chart_col2:
-                            st.subheader("KG Efficiency by Machine")
-                            kg_efficiency_chart = pd.DataFrame({
-                                'Machine': machine_data['Machine_No'],
-                                'KG Efficiency (%)': machine_data['KG_Variance_%']
-                            }).set_index('Machine')
-                            st.bar_chart(kg_efficiency_chart)
-                
-                with tab3:
-                    st.subheader("Capacity Report")
-                    capacity_report = transform_to_capacity_report(sections_analysis)
-                    
-                    # Display capacity report
-                    st.dataframe(
-                        capacity_report,
-                        use_container_width=True,
-                        height=400
-                    )
-                    
-                    # Download options
-                    download_col1, download_col2 = st.columns(2)
-                    
-                    with download_col1:
-                        csv = capacity_report.to_csv(index=False)
-                        st.download_button(
-                            "Download CSV Report",
-                            csv,
-                            "capacity_report.csv",
-                            "text/csv",
-                            key='download-csv'
-                        )
-                    
-                    with download_col2:
-                        # Fix for Excel download
-                        buffer = io.BytesIO()
-                        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                            capacity_report.to_excel(writer, index=False)
-                            writer.close()
-                        
-                        st.download_button(
-                            "Download Excel Report",
-                            buffer.getvalue(),
-                            "capacity_report.xlsx",
-                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key='download-excel'
-                        )
-                
-                with tab4:
-                    st.subheader("AI Analysis")
-                    if st.button("Generate AI Analysis", key="generate_analysis"):
-                        with st.spinner("Generating analysis..."):
-                            analysis = generate_claude_analysis(sections_analysis)
-                            st.markdown(analysis)
-                            
-                            # Option to download analysis
-                            st.download_button(
-                                "Download Analysis",
-                                analysis,
-                                "production_analysis.txt",
-                                "text/plain",
-                                key='download-analysis'
-                            )
-        
-        except Exception as e:
-            st.error(f"Error processing files: {e}")
-            logger.error(f"Application error: {e}")
-            st.stop()
-    
-    else:
-        st.info("Please upload Excel files to begin analysis")
-    
-    # Add footer with timestamp and version info
-    st.markdown("---")
-    footer_col1, footer_col2 = st.columns(2)
-    with footer_col1:
-        st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    with footer_col2:
-        st.caption("Capacity Labour Analysis Dashboard v1.0")
+            except Exception as e:
+                st.error(f"Error generating capacity report: {str(e)}")
+                logger.error(f"Capacity report generation error: {str(e)}", exc_info=True)
+        else:
+            st.warning("No data available for capacity report generation. Please upload and process files first.")
 
 if __name__ == "__main__":
     main()
