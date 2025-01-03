@@ -342,7 +342,7 @@ def transform_to_capacity_report(sections_with_summary: Dict[Tuple[str, str], pd
                 ]['Machine_No'].nunique()
                 
                 section['machines'] = max(section['machines'], active_machines)
-                section['weekly_volume'] += filtered_data['Packet_Produce'].sum()
+                section['weekly_volume'] += filtered_data['Packet_Produce'].sum() / 22  # Divide by 22 here
                 section['actual_hours'] += filtered_data['Hours'].sum()
                 section['total_target'] += filtered_data['Pkt'].sum()
                 efficiency = (filtered_data['Packet_Produce'].sum() / filtered_data['Pkt'].sum() * 100) if filtered_data['Pkt'].sum() > 0 else 0
@@ -397,7 +397,7 @@ def transform_to_capacity_report(sections_with_summary: Dict[Tuple[str, str], pd
         
         # Capacity calculations
         value_adding_hours = actual_hours / machines if machines > 0 else 0
-        ref_speed = weekly_volume / (actual_hours * 60) if actual_hours > 0 else 0
+        ref_speed = (weekly_volume * 22) / (actual_hours * 60) if actual_hours > 0 else 0  # Multiply by 22 here to get correct rate
         oee = (weekly_volume / target_volume * 100) if target_volume > 0 else 0
         
         # Labour calculations
@@ -577,12 +577,34 @@ def main():
     # Initialize variables at the start
     sections_with_summary = {}
     file_date = None
-    all_sections_data = []  # Initialize this at the start
+    all_sections_data = []
     processed_sheets = 0
     
     # File upload and configuration section
     with st.sidebar:
         st.header("Upload Settings")
+        
+        # Add file/sheet limit options
+        limit_type = st.radio(
+            "Limit processing by:",
+            ["No Limit", "Number of Files", "Number of Sheets"]
+        )
+        
+        if limit_type == "Number of Files":
+            max_files = st.number_input(
+                "Maximum number of files to process",
+                min_value=1,
+                value=5,
+                help="Enter the maximum number of files you want to process"
+            )
+        elif limit_type == "Number of Sheets":
+            max_sheets = st.number_input(
+                "Maximum number of sheets to process",
+                min_value=1,
+                value=10,
+                help="Enter the maximum number of sheets you want to process across all files"
+            )
+        
         batch_size = st.number_input(
             "Batch Size (sheets per process)",
             min_value=1,
@@ -599,8 +621,12 @@ def main():
         accept_multiple_files=True
     )
     
-    # Get file_date from the first uploaded file
     if uploaded_files:
+        # Apply file limit if selected
+        if limit_type == "Number of Files":
+            uploaded_files = uploaded_files[:max_files]
+            st.info(f"Processing first {max_files} files only")
+        
         try:
             first_file = uploaded_files[0].name
             import re
@@ -632,22 +658,39 @@ def main():
                 finally:
                     file.seek(0)
             
+            # Apply sheet limit if selected
+            if limit_type == "Number of Sheets":
+                sheets_to_process = min(total_sheets, max_sheets)
+                st.info(f"Processing first {sheets_to_process} sheets only")
+            else:
+                sheets_to_process = total_sheets
+            
             if show_progress:
                 st.info(f"Found {total_sheets} sheets in {len(uploaded_files)} files")
             
             # Process files in batches
+            sheets_processed = 0
             for file, n_sheets in file_info:
+                if limit_type == "Number of Sheets" and sheets_processed >= max_sheets:
+                    break
+                    
                 try:
                     excel_file = read_file(file)
                     
                     # Process sheets in batches
                     for i in range(0, n_sheets, batch_size):
+                        if limit_type == "Number of Sheets" and sheets_processed >= max_sheets:
+                            break
+                            
                         batch_sheets = excel_file.sheet_names[i:i + batch_size]
                         
                         for sheet_name in batch_sheets:
+                            if limit_type == "Number of Sheets" and sheets_processed >= max_sheets:
+                                break
+                                
                             if show_progress:
                                 status_text.text(f"Processing {file.name} - Sheet: {sheet_name}")
-                                progress_bar.progress(processed_sheets / total_sheets)
+                                progress_bar.progress(sheets_processed / sheets_to_process)
                             
                             try:
                                 df = pd.read_excel(excel_file, sheet_name=sheet_name)
@@ -670,6 +713,7 @@ def main():
                                             processed_df['Sheet'] = sheet_name
                                             all_sections_data.append(processed_df)
                                 
+                                sheets_processed += 1
                                 processed_sheets += 1
                                 
                             except Exception as e:
