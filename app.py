@@ -205,11 +205,35 @@ def process_section_data(df_section: pd.DataFrame, columns: List[str]) -> pd.Dat
     # Clean numeric columns
     clean_numeric_columns(df_section)
     
+    # Filter out rows where Machine_No contains just the section name and has all zeros
+    numeric_cols = ['Hours', 'Operator_Cost', 'Per_Pack', 'Bag_Produce', 
+                   'Packet_Produce', 'In_Kgs', 'target_Bag_Produce', 'Pkt']
+    
+    df_section = df_section[
+        ~(
+            # Check if the row has all zeros in numeric columns
+            df_section[numeric_cols].fillna(0).eq(0).all(axis=1) &
+            # And check if Machine_No contains section-like names
+            df_section['Machine_No'].astype(str).str.contains('Section|SECTION', case=False, na=False)
+        )
+    ]
+    
     # Remove rows where Machine_No is missing or invalid
     df_section = df_section[
         df_section['Machine_No'].notna() & 
         (df_section['Machine_No'].astype(str).str.strip() != '')
     ]
+    
+    # Check if section is empty (all numeric values are 0)
+    is_empty_section = all(
+        df_section[col].sum() == 0 
+        for col in numeric_cols 
+        if col in df_section.columns
+    )
+    
+    # Return None if section is empty
+    if is_empty_section:
+        return None
     
     return df_section
 
@@ -259,51 +283,30 @@ def add_summary_row(df: pd.DataFrame) -> pd.DataFrame:
 
 def transform_to_capacity_report(sections_with_summary: Dict[Tuple[str, str], pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Transform section analysis data into capacity report format matching EFESO template"""
-    # Use section sequence and identifiers from template.py
+    # Simplified section sequence without shift variations
     section_sequence = [
-        "BEASLEY DAY SHIFT PRODUCTION",
+        "BEASLEY SECTION",
         "SOS SECTION",
-        "Amazon ( Holweg + Garant ) Machines",
+        "Amazon",  # Simplified name for Amazon/Holweg section
         "GARANT SECTION",
         "HANDLE SECTION",
         "MATADOR SECTION",
         "WICKETTING SECTION",
-        "SHEETER SECTION",
-        "DAILY PRODUCTION REPORT (NIGHT SHIFT)",
-        "BEASLEY SECTION",
-        "MATADOR SECTION",
-        "SOS SECTION",
-        "GARANT SECTION",
-        "SHEETER SECTION",
-        "Amazon ( Holweg + Garant ) Machines",
-        "HANDLE SECTION"
+        "SHEETER SECTION"
     ]
     
-    # Define section identifiers with variations
-    section_identifiers = {
-        "BEASLEY DAY SHIFT PRODUCTION": ["BEASLEY", "B-"],
-        "SOS SECTION": ["SOS", "CH-"],
-        "Amazon ( Holweg + Garant ) Machines": ["AMAZON", "HOLWEG", "GARANT MACHINES", "AMAZON ( HOLWEG", "HOLWEG + GARANT"],
-        "GARANT SECTION": ["GARANT SECTION"],
-        "HANDLE SECTION": ["HANDLE"],
-        "MATADOR SECTION": ["MATADOR"],
-        "WICKETTING SECTION": ["WICKETTING"],
-        "SHEETER SECTION": ["SHEETER"],
-        "BEASLEY SECTION": ["BEASLEY", "B-"],
-        "DAILY PRODUCTION REPORT (NIGHT SHIFT)": ["NIGHT SHIFT", "NIGHT PRODUCTION"]
+    # Define section mappings to combine related sections
+    section_mappings = {
+        "BEASLEY DAY SHIFT PRODUCTION": "BEASLEY SECTION",
+        "BEASLEY SECTION": "BEASLEY SECTION",
+        "SOS SECTION": "SOS SECTION",
+        "Amazon ( Holweg + Garant ) Machines": "Amazon",
+        "GARANT SECTION": "GARANT SECTION",
+        "HANDLE SECTION": "HANDLE SECTION",
+        "MATADOR SECTION": "MATADOR SECTION",
+        "WICKETTING SECTION": "WICKETTING SECTION",
+        "SHEETER SECTION": "SHEETER SECTION"
     }
-    
-    # Get unique sections for the report
-    unique_sections = []
-    seen_sections = set()
-    for section in section_sequence:
-        base_section = section.split("(")[0].strip()  # Remove shift indicators
-        if base_section not in seen_sections and base_section != "DAILY PRODUCTION REPORT":
-            unique_sections.append(base_section)
-            seen_sections.add(base_section)
-    
-    # Add Total to the sections
-    processes = unique_sections + ["Total"]
     
     # Initialize data structures for each section
     combined_sections = {process: {
@@ -314,28 +317,41 @@ def transform_to_capacity_report(sections_with_summary: Dict[Tuple[str, str], pd
         'efficiency_count': 0,
         'total_manhours': 0,
         'total_target': 0
-    } for process in processes[:-1]}  # Exclude Total
-    
-    # Helper function to get base section name
-    def get_base_section(section_name: str) -> str:
-        for base_section, identifiers in section_identifiers.items():
-            if any(identifier in section_name.upper() for identifier in identifiers):
-                return base_section.split("(")[0].strip()
-        return section_name.split("(")[0].strip()
+    } for process in section_sequence}
     
     # Process data from sections
     for (section_name, shift), data in sections_with_summary.items():
-        base_section = get_base_section(section_name)
+        # Map the section name to its consolidated name
+        base_section = section_mappings.get(section_name.strip())
         if base_section in combined_sections:
-            section = combined_sections[base_section]
-            section['machines'] = max(section['machines'], data['Machine_No'].nunique())
-            section['weekly_volume'] += data['Packet_Produce'].sum()
-            section['actual_hours'] += data['Hours'].sum()
-            section['total_target'] += data['Pkt'].sum()
-            efficiency = (data['Packet_Produce'].sum() / data['Pkt'].sum() * 100) if data['Pkt'].sum() > 0 else 0
-            section['efficiency_sum'] += efficiency
-            section['efficiency_count'] += 1
-            section['total_manhours'] += data['Hours'].sum()
+            # Filter out rows where Machine_No contains section name and has all zeros
+            numeric_cols = ['Hours', 'Operator_Cost', 'Per_Pack', 'Bag_Produce', 
+                          'Packet_Produce', 'In_Kgs', 'target_Bag_Produce', 'Pkt']
+            
+            filtered_data = data[
+                ~(
+                    data[numeric_cols].fillna(0).eq(0).all(axis=1) &
+                    data['Machine_No'].astype(str).str.contains('Section|SECTION', case=False, na=False)
+                )
+            ]
+            
+            if not filtered_data.empty:
+                section = combined_sections[base_section]
+                active_machines = filtered_data[
+                    ~filtered_data[numeric_cols].fillna(0).eq(0).all(axis=1)
+                ]['Machine_No'].nunique()
+                
+                section['machines'] = max(section['machines'], active_machines)
+                section['weekly_volume'] += filtered_data['Packet_Produce'].sum()
+                section['actual_hours'] += filtered_data['Hours'].sum()
+                section['total_target'] += filtered_data['Pkt'].sum()
+                efficiency = (filtered_data['Packet_Produce'].sum() / filtered_data['Pkt'].sum() * 100) if filtered_data['Pkt'].sum() > 0 else 0
+                section['efficiency_sum'] += efficiency
+                section['efficiency_count'] += 1
+                section['total_manhours'] += filtered_data['Hours'].sum()
+    
+    # Add Total to the sections
+    processes = section_sequence + ["Total"]
     
     # Create capacity and labour data structures
     capacity_data = {
@@ -558,8 +574,11 @@ def main():
     
     st.title("Production Analysis Dashboard")
     
-    # Initialize sections_with_summary at the start
+    # Initialize variables at the start
     sections_with_summary = {}
+    file_date = None
+    all_sections_data = []  # Initialize this at the start
+    processed_sheets = 0
     
     # File upload and configuration section
     with st.sidebar:
@@ -580,7 +599,19 @@ def main():
         accept_multiple_files=True
     )
     
+    # Get file_date from the first uploaded file
     if uploaded_files:
+        try:
+            first_file = uploaded_files[0].name
+            import re
+            date_match = re.search(r'(\d{8})', first_file)
+            if date_match:
+                date_str = date_match.group(1)
+                file_date = datetime.strptime(date_str, '%Y%m%d').strftime('%Y-%m-%d')
+        except:
+            pass
+        
+        # Process the files
         try:
             # Initialize progress tracking
             if show_progress:
@@ -605,9 +636,6 @@ def main():
                 st.info(f"Found {total_sheets} sheets in {len(uploaded_files)} files")
             
             # Process files in batches
-            all_sections_data = []
-            processed_sheets = 0
-            
             for file, n_sheets in file_info:
                 try:
                     excel_file = read_file(file)
@@ -635,11 +663,12 @@ def main():
                                             'Pkt', 'KG_Target'
                                         ]
                                         processed_df = process_section_data(section['data'], columns)
-                                        processed_df['Section'] = section['name']
-                                        processed_df['Shift'] = section['shift']
-                                        processed_df['File'] = file.name
-                                        processed_df['Sheet'] = sheet_name
-                                        all_sections_data.append(processed_df)
+                                        if processed_df is not None:  # Only add non-empty sections
+                                            processed_df['Section'] = section['name']
+                                            processed_df['Shift'] = section['shift']
+                                            processed_df['File'] = file.name
+                                            processed_df['Sheet'] = sheet_name
+                                            all_sections_data.append(processed_df)
                                 
                                 processed_sheets += 1
                                 
@@ -655,21 +684,84 @@ def main():
                 progress_bar.progress(1.0)
                 status_text.text("Processing complete!")
             
-            if all_sections_data:
-                # Create final dataframe
+            if all_sections_data:  # Move the download options here
+                # Create final dataframe and process data
                 final_df = pd.concat(all_sections_data, ignore_index=True)
-                
-                # Group by section and shift
                 grouped = final_df.groupby(['Section', 'Shift'])
-                
-                # Create sections_with_summary dictionary
                 sections_with_summary = {
                     (section_name, shift): group_data
                     for (section_name, shift), group_data in grouped
                 }
                 
-                # Display summary statistics
-                st.subheader("Processing Summary:")
+                # Now show download options
+                st.header("Download Options")
+                download_col1, download_col2, download_col3 = st.columns(3)
+                
+                with download_col1:
+                    # Excel download button
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                        # Write each section to a separate sheet
+                        for (section_name, shift), group_data in sections_with_summary.items():
+                            sheet_name = f"{section_name[:20]}_{shift}"
+                            group_with_summary = add_summary_row(group_data)
+                            group_with_summary.to_excel(writer, sheet_name=sheet_name, index=False)
+                        
+                        # Write summary sheet
+                        summary_df = pd.DataFrame({
+                            'Section': [k[0] for k in sections_with_summary.keys()],
+                            'Shift': [k[1] for k in sections_with_summary.keys()],
+                            'Total Machines': [v['Machine_No'].nunique() for v in sections_with_summary.values()],
+                            'Total Hours': [v['Hours'].sum() for v in sections_with_summary.values()]
+                        })
+                        summary_df.to_excel(writer, sheet_name='Summary', index=False)
+                    
+                    st.download_button(
+                        label="Download Detailed Report (Excel)",
+                        data=buffer.getvalue(),
+                        file_name="production_data_report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                
+                with download_col2:
+                    # CSV download button
+                    csv_buffer = io.StringIO()
+                    pd.concat(sections_with_summary.values(), ignore_index=True).to_csv(csv_buffer, index=False)
+                    st.download_button(
+                        label="Download All Data (CSV)",
+                        file_name="production_data.csv",
+                        data=csv_buffer.getvalue(),
+                        mime="text/csv"
+                    )
+                
+                with download_col3:
+                    # Capacity report generation and download
+                    try:
+                        capacity_df, labour_df = transform_to_capacity_report(sections_with_summary)
+                        report_bytes = export_capacity_report(capacity_df, labour_df, file_date)
+                        st.download_button(
+                            label="Download Capacity Report (Excel)",
+                            data=report_bytes,
+                            file_name=f"capacity_report_{file_date or 'generated'}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                        
+                        # Capacity Report Preview
+                        with st.expander("Capacity Report Preview", expanded=False):
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.write("Capacity Data")
+                                st.dataframe(capacity_df.astype(str))  # Convert to string to avoid Arrow conversion issues
+                            with col2:
+                                st.write("Labour Data")
+                                st.dataframe(labour_df.astype(str))  # Convert to string to avoid Arrow conversion issues
+                                
+                    except Exception as e:
+                        st.error(f"Error generating capacity report: {str(e)}")
+                        logger.error(f"Capacity report generation error: {str(e)}", exc_info=True)
+                
+                # Processing Summary
+                st.header("Processing Summary")
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("Files Processed", len(uploaded_files))
@@ -678,111 +770,20 @@ def main():
                 with col3:
                     st.metric("Sections Found", len(grouped))
                 
-                # Display sections and their data with summary rows
-                st.subheader("Sections and Their Data:")
-                
+                # Detailed Section Data
+                st.header("Detailed Section Data")
                 for (section_name, shift), group_data in grouped:
-                    # Add summary row to the group data
-                    group_with_summary = add_summary_row(group_data)
-                    sections_with_summary[(section_name, shift)] = group_with_summary
+                    # Skip empty sections
+                    numeric_cols = ['Hours', 'Operator_Cost', 'Per_Pack', 'Bag_Produce', 
+                                   'Packet_Produce', 'In_Kgs', 'target_Bag_Produce', 'Pkt']
+                    if all(group_data[col].sum() == 0 for col in numeric_cols if col in group_data.columns):
+                        continue
                     
+                    group_with_summary = add_summary_row(group_data)
                     with st.expander(f"{section_name} ({shift})", expanded=True):
                         st.dataframe(
                             group_with_summary.drop(['Section', 'Shift'], axis=1),
                             use_container_width=True
-                        )
-                
-                # Download options
-                st.subheader("Download Options")
-                col1, col2 = st.columns(2)
-                
-                # Prepare Excel file with multiple sheets including summary rows
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                    # Summary sheet
-                    summary_data = {
-                        'Section': [],
-                        'Shift': [],
-                        'Total Unique Machines': [],
-                        'Total Hours': [],
-                        'Total Operator Cost': [],
-                        'Total Per Pack': [],
-                        'Total Bag Produce': [],
-                        'Total Packet Produce': [],
-                        'Total In Kgs': [],
-                        'Total Target Bag Produce': [],
-                        'Total Pkt': [],
-                        'Total KG Target': []
-                    }
-                    
-                    # Write each section to a separate sheet
-                    for (section_name, shift), group_data in sections_with_summary.items():
-                        # Add to summary
-                        summary_data['Section'].append(section_name)
-                        summary_data['Shift'].append(shift)
-                        summary_data['Total Unique Machines'].append(group_data['Machine_No'].nunique())
-                        summary_data['Total Hours'].append(group_data['Hours'].sum())
-                        summary_data['Total Operator Cost'].append(group_data['Operator_Cost'].sum())
-                        summary_data['Total Per Pack'].append(group_data['Per_Pack'].sum())
-                        summary_data['Total Bag Produce'].append(group_data['Bag_Produce'].sum())
-                        summary_data['Total Packet Produce'].append(group_data['Packet_Produce'].sum())
-                        summary_data['Total In Kgs'].append(group_data['In_Kgs'].sum())
-                        summary_data['Total Target Bag Produce'].append(group_data['target_Bag_Produce'].sum())
-                        summary_data['Total Pkt'].append(group_data['Pkt'].sum())
-                        summary_data['Total KG Target'].append(group_data['KG_Target'].sum())
-                        
-                        # Write section data with summary row
-                        sheet_name = f"{section_name[:20]}_{shift}"
-                        group_data.to_excel(writer, sheet_name=sheet_name, index=False)
-                        
-                        # Format sheet
-                        worksheet = writer.sheets[sheet_name]
-                        header_format = writer.book.add_format({
-                            'bold': True,
-                            'bg_color': '#D3D3D3'
-                        })
-                        summary_format = writer.book.add_format({
-                            'bold': True,
-                            'bg_color': '#FFE4B5'  # Light orange for summary row
-                        })
-                        
-                        # Format headers
-                        for col_num, value in enumerate(group_data.columns.values):
-                            worksheet.write(0, col_num, value, header_format)
-                        
-                        # Format summary row
-                        last_row = len(group_data)
-                        for col_num in range(len(group_data.columns)):
-                            worksheet.write(last_row, col_num, 
-                                         group_data.iloc[-1][group_data.columns[col_num]], 
-                                         summary_format)
-                    
-                    # Write summary sheet
-                    summary_df = pd.DataFrame(summary_data)
-                    summary_df.to_excel(writer, sheet_name='Summary', index=False)
-                    
-                    # Format summary sheet
-                    summary_sheet = writer.sheets['Summary']
-                    for col_num, value in enumerate(summary_df.columns.values):
-                        summary_sheet.write(0, col_num, value, header_format)
-                
-                with col1:
-                    st.download_button(
-                        label="Download Full Report (Excel)",
-                        data=buffer.getvalue(),
-                        file_name="production_data_report.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                
-                with col2:
-                    # Prepare CSV of all data including summary rows
-                    csv_buffer = io.StringIO()
-                    pd.concat(sections_with_summary.values(), ignore_index=True).to_csv(csv_buffer, index=False)
-                    st.download_button(
-                        label="Download All Data (CSV)",
-                        data=csv_buffer.getvalue(),
-                        file_name="production_data.csv",
-                        mime="text/csv"
                     )
             else:
                 st.warning("No data was processed. Please check your input files.")
@@ -790,54 +791,6 @@ def main():
         except Exception as e:
             st.error(f"Error processing files: {str(e)}")
             logger.error(f"Processing error: {str(e)}", exc_info=True)
-
-    # Add capacity report generation section
-    with st.expander("Generate Capacity Report", expanded=False):
-        st.info("Generate a capacity report in EFESO template format")
-        
-        # Get the date from the first file name if available
-        file_date = None
-        if uploaded_files:
-            try:
-                first_file = uploaded_files[0].name
-                # Try to extract date from filename (assuming format contains YYYYMMDD)
-                import re
-                date_match = re.search(r'(\d{8})', first_file)
-                if date_match:
-                    date_str = date_match.group(1)
-                    file_date = datetime.strptime(date_str, '%Y%m%d').strftime('%Y-%m-%d')
-            except:
-                pass
-        
-        if sections_with_summary:
-            try:
-                # Generate capacity report
-                capacity_df, labour_df = transform_to_capacity_report(sections_with_summary)
-                
-                # Display preview
-                st.subheader("Capacity Report Preview")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.write("Capacity Data")
-                    st.dataframe(capacity_df)
-                with col2:
-                    st.write("Labour Data")
-                    st.dataframe(labour_df)
-                
-                # Export button
-                report_bytes = export_capacity_report(capacity_df, labour_df, file_date)
-                st.download_button(
-                    label="Download Capacity Report (Excel)",
-                    data=report_bytes,
-                    file_name=f"capacity_report_{file_date or 'generated'}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                
-            except Exception as e:
-                st.error(f"Error generating capacity report: {str(e)}")
-                logger.error(f"Capacity report generation error: {str(e)}", exc_info=True)
-        else:
-            st.warning("No data available for capacity report generation. Please upload and process files first.")
 
 if __name__ == "__main__":
     main()
